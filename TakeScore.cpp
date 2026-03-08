@@ -56,15 +56,36 @@ WavFile loadWav(const std::string& path) {
     if (std::strncmp(hdr.riff, "RIFF", 4) != 0 || std::strncmp(hdr.wave, "WAVE", 4) != 0) {
         wav.error = "Not a valid WAV file"; return wav;
     }
-    if (hdr.audioFormat != 1 && hdr.audioFormat != 3) {
-        wav.error = "Unsupported format"; return wav;
+    // WAVE_FORMAT_EXTENSIBLE (0xFFFE) wraps PCM or float with an extended
+    // header.  The real format tag sits at byte offset 24 of the fmt chunk
+    // (i.e. 8 bytes into the extended area: cbSize(2) + validBits(2) +
+    // channelMask(4), then the first two bytes of the 16-byte SubFormat GUID).
+    uint16_t effectiveFormat = hdr.audioFormat;
+    if (hdr.audioFormat == 0xFFFE && hdr.fmtSize >= 40) {
+        // We already read the first 16 bytes of the fmt chunk (the base
+        // WAVEFORMATEX fields).  The sub-format GUID starts 8 bytes later.
+        // Read cbSize(2) + validBitsPerSample(2) + channelMask(4) + subFormat(2).
+        uint16_t cbSize, validBits;
+        uint32_t channelMask;
+        uint16_t subFormat;
+        f.read(reinterpret_cast<char*>(&cbSize), 2);
+        f.read(reinterpret_cast<char*>(&validBits), 2);
+        f.read(reinterpret_cast<char*>(&channelMask), 4);
+        f.read(reinterpret_cast<char*>(&subFormat), 2);
+        effectiveFormat = subFormat;  // 1 = PCM, 3 = IEEE float
+        // Skip the remaining 14 bytes of the SubFormat GUID + any extra data
+        int consumed = 2 + 2 + 4 + 2;  // 10 bytes read above
+        int remaining = (int)hdr.fmtSize - 16 - consumed;
+        if (remaining > 0) f.seekg(remaining, std::ios::cur);
+    } else if (hdr.fmtSize > 16) {
+        // Non-extensible format with extra fmt bytes (e.g. cbSize for format 3)
+        f.seekg(hdr.fmtSize - 16, std::ios::cur);
     }
 
-    // Skip any extra bytes in the fmt chunk (e.g. cbSize field for format 3,
-    // or the extended WAVEFORMATEXTENSIBLE header).  fmtSize tells us how many
-    // bytes the fmt chunk body contains; we already consumed 16 of them above.
-    if (hdr.fmtSize > 16)
-        f.seekg(hdr.fmtSize - 16, std::ios::cur);
+    if (effectiveFormat != 1 && effectiveFormat != 3) {
+        wav.error = "Unsupported format (code " + std::to_string(effectiveFormat) + ")";
+        return wav;
+    }
 
     char chunkId[4]; uint32_t chunkSize;
     while (f.read(chunkId, 4) && f.read(reinterpret_cast<char*>(&chunkSize), 4)) {
@@ -92,7 +113,7 @@ WavFile loadWav(const std::string& path) {
                 if (v & 0x800000) v |= ~0x00FFFFFF; // sign-extend
                 s = v / 8388608.f;
             }
-            else if (hdr.bitsPerSample == 32 && hdr.audioFormat == 3) {
+            else if (hdr.bitsPerSample == 32 && effectiveFormat == 3) {
                 f.read(reinterpret_cast<char*>(&s), 4);
             }
             else if (hdr.bitsPerSample == 32) {
