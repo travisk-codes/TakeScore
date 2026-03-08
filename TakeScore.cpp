@@ -60,10 +60,17 @@ WavFile loadWav(const std::string& path) {
         wav.error = "Unsupported format"; return wav;
     }
 
+    // Skip any extra bytes in the fmt chunk (e.g. cbSize field for format 3,
+    // or the extended WAVEFORMATEXTENSIBLE header).  fmtSize tells us how many
+    // bytes the fmt chunk body contains; we already consumed 16 of them above.
+    if (hdr.fmtSize > 16)
+        f.seekg(hdr.fmtSize - 16, std::ios::cur);
+
     char chunkId[4]; uint32_t chunkSize;
     while (f.read(chunkId, 4) && f.read(reinterpret_cast<char*>(&chunkSize), 4)) {
         if (std::strncmp(chunkId, "data", 4) == 0) break;
-        f.seekg(chunkSize, std::ios::cur);
+        // WAV chunks are word-aligned: skip an extra byte if chunkSize is odd
+        f.seekg(chunkSize + (chunkSize & 1), std::ios::cur);
     }
 
     wav.sampleRate = hdr.sampleRate;
@@ -72,7 +79,7 @@ WavFile loadWav(const std::string& path) {
 
     uint32_t numFrames = chunkSize / (hdr.numChannels * hdr.bitsPerSample / 8);
     wav.samples.reserve(numFrames);
-    for (uint32_t i = 0; i < numFrames; ++i) {
+    for (uint32_t i = 0; i < numFrames && f.good(); ++i) {
         float mono = 0.f;
         for (uint16_t ch = 0; ch < hdr.numChannels; ++ch) {
             float s = 0.f;
@@ -82,7 +89,8 @@ WavFile loadWav(const std::string& path) {
             else if (hdr.bitsPerSample == 24) {
                 uint8_t b[3]; f.read(reinterpret_cast<char*>(b), 3);
                 int32_t v = (b[2] << 16) | (b[1] << 8) | b[0];
-                if (v & 0x800000) v |= 0xFF000000; s = v / 8388608.f;
+                if (v & 0x800000) v |= ~0x00FFFFFF; // sign-extend
+                s = v / 8388608.f;
             }
             else if (hdr.bitsPerSample == 32 && hdr.audioFormat == 3) {
                 f.read(reinterpret_cast<char*>(&s), 4);
@@ -113,7 +121,7 @@ Scale parseScale(const std::string& keyStr) {
     Scale sc;
     if (keyStr.empty()) return sc;
     static const std::map<char, int> base = { {'C',0},{'D',2},{'E',4},{'F',5},{'G',7},{'A',9},{'B',11} };
-    char c = std::toupper(keyStr[0]);
+    char c = static_cast<char>(std::toupper(static_cast<unsigned char>(keyStr[0])));
     if (base.find(c) == base.end()) {
         std::cerr << "Warning: unknown key '" << keyStr << "'\n"; return sc;
     }
@@ -122,7 +130,7 @@ Scale parseScale(const std::string& keyStr) {
     else if (keyStr.size() > 1 && keyStr[1] == 'b') { root = (root + 11) % 12; consumed = 2; }
 
     std::string suf = keyStr.substr(consumed);
-    for (auto& ch : suf) ch = std::tolower(ch);
+    for (auto& ch : suf) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
     bool minor = (suf == "m" || suf == "min" || suf == "minor");
 
     std::vector<int> iv = minor ? std::vector<int>{0, 2, 3, 5, 7, 8, 10}
@@ -140,7 +148,7 @@ Scale parseScale(const std::string& keyStr) {
 static const float YIN_THR = 0.15f;
 static const int   YIN_WIN = 2048;
 static const int   MIN_PER = 20;
-static const int   MAX_PER = 2000;
+static const int   MAX_PER = 900; // capped by H = YIN_WIN/2 = 1024 in practice
 
 float yinPitch(const float* buf, int N, int sr) {
     int H = N / 2;
@@ -380,10 +388,12 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
     // making a flat A# appear sharp relative to A (and vice-versa).
     bool hasScale = !scale.pitchClasses.empty();
     auto nearestNote = [&](float midi)->float {
-        int lo = (int)std::floor(midi) - 1;
+        // Search ±6 semitones to handle gapped scales (pentatonic gaps can be
+        // 3 semitones; ±6 covers any 7-note-or-fewer scale comfortably).
+        int center = (int)std::round(midi);
         float bestDist = 1e9f;
-        int bestNote = (int)std::round(midi);
-        for (int c = lo; c <= lo + 3; ++c) {
+        int bestNote = center;
+        for (int c = center - 6; c <= center + 6; ++c) {
             if (hasScale) {
                 int pc = ((c % 12) + 12) % 12;
                 if (!scale.pitchClasses.count(pc)) continue;
@@ -392,7 +402,7 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
             if (dist < bestDist) { bestDist = dist; bestNote = c; }
         }
         return (float)bestNote;
-        };
+    };
 
     // Vibrato-aware accuracy: windowed median → nearest note → cents deviation
     if (!vm.empty()) {
@@ -656,13 +666,11 @@ const N12=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
 function midiToName(m){const n=Math.round(m);return N12[((n%12)+12)%12]+(Math.floor(n/12)-1);}
 function fmtDur(s){const m=Math.floor(s/60),sec=(s%60).toFixed(1);return m>0?`${m}m ${sec}s`:`${sec}s`;}
 function nearestNote(midi){
-  // Search the two closest semitones and pick the one with minimum distance.
-  // Using Math.round() as a starting point caused pitches near a semitone
-  // boundary (e.g. 69.4 = slightly flat of A#4) to snap to the wrong
-  // neighbour (A4), then be reported with the wrong sharp/flat direction.
-  const lo=Math.floor(midi)-1;
-  let bestDist=Infinity,bestNote=Math.round(midi);
-  for(let c=lo;c<=lo+3;c++){
+  // Search +/-6 semitones to handle gapped scales (pentatonic gaps can be
+  // 3 semitones; +/-6 covers any 7-note-or-fewer scale comfortably).
+  const center=Math.round(midi);
+  let bestDist=Infinity,bestNote=center;
+  for(let c=center-6;c<=center+6;c++){
     if(SCALE.length&&!SCALE.includes(((c%12)+12)%12))continue;
     const dist=Math.abs(midi-c);
     if(dist<bestDist){bestDist=dist;bestNote=c;}
@@ -774,6 +782,11 @@ function switchTake(ti){
 }
 updateStats(0);
 
+// -- State variables ------------------------------------------
+let hovBin=null;
+let seekTime=null;
+let cvHover=null;
+
 // -- Draw pitch chart -----------------------------------------
 const P={L:46,R:14,T:12,B:20};
 
@@ -825,14 +838,14 @@ function drawPitch(){
   const fillColor=(pitchY,noteY)=>pitchY<noteY?sharpColor:flatColor;
   const frames=t.frames;
   for(let i=0;i<frames.length-1;i++){
-    const f0=frames[i],f1=frames[i+1];
-    if(!f0.v||!f1.v)continue;
-    if(f1.t-f0.t>0.15)continue; // skip gap-filled seams
-    const n0=nearestNote(f0.midi),n1=nearestNote(f1.midi);
-    const c0=(f0.midi-n0)*100,c1=(f1.midi-n1)*100;
+    const fr0=frames[i],fr1=frames[i+1];
+    if(!fr0.v||!fr1.v)continue;
+    if(fr1.t-fr0.t>0.15)continue; // skip gap-filled seams
+    const n0=nearestNote(fr0.midi),n1=nearestNote(fr1.midi);
+    const c0=(fr0.midi-n0)*100,c1=(fr1.midi-n1)*100;
     if(Math.abs(c0)<1&&Math.abs(c1)<1)continue;
-    const x0=tX(f0.t),x1=tX(f1.t);
-    const py0=mY(f0.midi),py1=mY(f1.midi);
+    const x0=tX(fr0.t),x1=tX(fr1.t);
+    const py0=mY(fr0.midi),py1=mY(fr1.midi);
     if(n0===n1){
       const ny=mY(n0);
       if(Math.abs(py0-ny)<0.5&&Math.abs(py1-ny)<0.5)continue;
@@ -848,7 +861,7 @@ function drawPitch(){
         // Pitch crosses through the note line  -  drawing a single trapezoid
         // produces a self-intersecting (bowtie) shape and wrong color.
         // Split at the crossing point and draw two triangles instead.
-        const frac=Math.max(0,Math.min(1,(n0-f0.midi)/(f1.midi-f0.midi)));
+        const frac=Math.max(0,Math.min(1,(n0-fr0.midi)/(fr1.midi-fr0.midi)));
         const xC=x0+frac*(x1-x0);
         // First triangle: from start to crossing
         ctx.fillStyle=fillColor(py0,ny);
@@ -859,8 +872,8 @@ function drawPitch(){
       }
     } else {
       // Note changes mid-segment  -  split at boundary, flat bottom for each half
-      const denom=(f1.midi-f0.midi)-(n1-n0);
-      const frac=Math.abs(denom)>0.01?Math.max(0,Math.min(1,(n0-f0.midi)/denom)):0.5;
+      const denom=(fr1.midi-fr0.midi)-(n1-n0);
+      const frac=Math.abs(denom)>0.01?Math.max(0,Math.min(1,(n0-fr0.midi)/denom)):0.5;
       const xC=x0+frac*(x1-x0);
       const pyC=py0+frac*(py1-py0);
       // First half: pitch vs n0
@@ -1021,11 +1034,11 @@ function drawWave(){
     const time=(i/steps)*t.duration,x=P.L+(i/steps)*W;
     wctx.fillText(BPM>0?(time/(60/BPM)).toFixed(0)+'b':time.toFixed(1)+'s',x,CH-2);
   }
-  // Seek cursor on waveform
+  // Seek cursor on waveform (absolute position in the full-duration overview)
   if(seekTime!==null){
-    const t2=TAKES[ati],vp2=vps[ati];
+    const t2=TAKES[ati];
     const W2=wv.offsetWidth-P.L-P.R;
-    const frac2=(seekTime-vp2.t0)/(vp2.t1-vp2.t0);
+    const frac2=t2.duration>0?seekTime/t2.duration:0;
     if(frac2>=0&&frac2<=1){
       const sx=P.L+frac2*W2;
       wctx.strokeStyle='rgba(255,210,40,0.8)';wctx.lineWidth=1.5;
@@ -1131,9 +1144,6 @@ cv.addEventListener('mouseleave',()=>{if(cvHover){cvHover=null;redraw();}});
 
 // -- Waveform click to seek ------------------------------------
 // -- Waveform strip drag-to-pan --------------------------------
-let hovBin=null;
-let seekTime=null;
-let cvHover=null;
 let wvDrag=null;
 wv.style.cursor='grab';
 wv.addEventListener('mousedown',e=>{
@@ -1158,11 +1168,12 @@ window.addEventListener('mousemove',e=>{
 window.addEventListener('mouseup',e=>{
   if(wvDrag){
     if(Math.abs(e.clientX-wvDrag.x)<5){
-      const vp=vps[ati],t=TAKES[ati];
+      // The waveform strip shows the full duration, so map click to absolute time
+      const t=TAKES[ati];
       const W=wv.offsetWidth-P.L-P.R;
       const r=wv.getBoundingClientRect();
-      const frac=(e.clientX-r.left-P.L)/W;
-      seekTime=Math.max(0,Math.min(t.duration,vp.t0+frac*(vp.t1-vp.t0)));
+      const frac=Math.max(0,Math.min(1,(e.clientX-r.left-P.L)/W));
+      seekTime=frac*t.duration;
     }
     wvDrag=null;wv.style.cursor='grab';redraw();
   }
