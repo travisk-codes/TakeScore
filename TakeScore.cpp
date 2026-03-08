@@ -143,36 +143,126 @@ Scale parseScale(const std::string& keyStr) {
 }
 
 // ─────────────────────────────────────────────
-//  YIN Pitch Detection
+//  YIN Pitch Detection (improved)
 // ─────────────────────────────────────────────
-static const float YIN_THR = 0.15f;
-static const int   YIN_WIN = 2048;
-static const int   MIN_PER = 20;
-static const int   MAX_PER = 900; // capped by H = YIN_WIN/2 = 1024 in practice
+//
+// Improvements over baseline YIN:
+//   1. Adaptive window size: scales with sample rate so low frequencies
+//      always get at least two full periods inside the analysis window.
+//   2. Confidence output: the CMNDF dip value is returned alongside the
+//      pitch, letting the caller make better voiced/unvoiced decisions.
+//   3. Octave-error correction: after finding a candidate period T, we
+//      check whether 2T (the sub-harmonic / true fundamental) has a
+//      CMNDF value that is nearly as good.  If so, we pick 2T.  This is
+//      the single most common YIN failure mode.
+//   4. Global-minimum fallback: when no dip crosses the primary threshold,
+//      the best local minimum is returned with a reduced confidence score
+//      instead of silently returning 0 Hz.
+// ─────────────────────────────────────────────
 
-float yinPitch(const float* buf, int N, int sr) {
+static const float YIN_THR       = 0.12f;   // primary CMNDF threshold (slightly tighter)
+static const float YIN_THR_FALL  = 0.30f;   // fallback: accept global minimum up to this
+static const float YIN_OCTAVE_THR = 0.15f;  // CMNDF penalty tolerance for sub-harmonic check
+
+struct YinResult { float hz; float confidence; };
+
+// Adaptive window: ~46 ms at any sample rate (2048 @ 44100, 4096 @ 96000, etc.)
+// Rounded up to next power of two for cache-friendliness.
+static int yinWindowSize(int sr) {
+    int target = (int)(sr * 0.047f); // ~47 ms
+    int w = 256;
+    while (w < target) w <<= 1;
+    return w;
+}
+
+// Parabolic interpolation around index `tau` in array `c` of length `len`.
+// Returns fractional offset from tau (in range roughly -0.5 .. +0.5).
+static float parabolicShift(const std::vector<float>& c, int tau, int len) {
+    if (tau < 1 || tau >= len - 1) return 0.f;
+    float s0 = c[tau - 1], s1 = c[tau], s2 = c[tau + 1];
+    float denom = 2.f * s1 - s2 - s0;
+    if (std::abs(denom) < 1e-12f) return 0.f;
+    return (s2 - s0) / (2.f * denom);
+}
+
+YinResult yinPitch(const float* buf, int N, int sr) {
     int H = N / 2;
+    // Lag range: MIN_PER corresponds to ~2200 Hz, MAX_PER to ~55 Hz
+    int minPer = std::max(2, (int)(sr / 2200.f));
+    int maxPer = std::min(H - 2, (int)(sr / 55.f));
+
+    // Step 1 – Difference function  d(tau) = sum_j (buf[j] - buf[j+tau])^2
     std::vector<float> d(H, 0.f);
     for (int tau = 1; tau < H; ++tau)
         for (int j = 0; j < H; ++j) { float dv = buf[j] - buf[j + tau]; d[tau] += dv * dv; }
+
+    // Step 2 – Cumulative Mean Normalized Difference Function (CMNDF)
     std::vector<float> c(H, 0.f); c[0] = 1.f;
     float rs = 0.f;
     for (int tau = 1; tau < H; ++tau) { rs += d[tau]; c[tau] = d[tau] * tau / (rs + 1e-10f); }
-    int tau = MIN_PER;
-    while (tau < MAX_PER && tau < H - 1) {
-        if (c[tau] < YIN_THR) {
-            // Advance to the local minimum of this dip before interpolating.
-            // Stopping at the first threshold crossing (the leading edge) means
-            // parabolic interpolation anchors left of the true minimum, which
-            // makes the returned period too long and the pitch systematically flat.
-            while (tau + 1 < H - 1 && c[tau + 1] < c[tau]) ++tau;
-            float s0 = c[tau - 1], s1 = c[tau], s2 = c[tau + 1];
-            float sh = (s2 - s0) / (2.f * (2.f * s1 - s2 - s0) + 1e-10f);
-            return (float)sr / (tau + sh);
+
+    // Step 3 – Threshold search: find first dip below YIN_THR, then walk to its local minimum.
+    int bestTau = -1;
+    float bestVal = 1e9f;
+    // Also track global best minimum for fallback
+    int globalBestTau = -1;
+    float globalBestVal = 1e9f;
+
+    for (int tau = minPer; tau <= maxPer; ++tau) {
+        // Track global minimum
+        if (c[tau] < globalBestVal && tau > 0 && tau < H - 1 &&
+            c[tau] <= c[tau - 1] && c[tau] <= c[tau + 1]) {
+            globalBestVal = c[tau];
+            globalBestTau = tau;
         }
-        ++tau;
     }
-    return 0.f;
+
+    // Primary search: first dip below threshold, walked to local minimum
+    {
+        int tau = minPer;
+        while (tau <= maxPer && tau < H - 1) {
+            if (c[tau] < YIN_THR) {
+                while (tau + 1 < H - 1 && tau + 1 <= maxPer && c[tau + 1] < c[tau]) ++tau;
+                bestTau = tau;
+                bestVal = c[tau];
+                break;
+            }
+            ++tau;
+        }
+    }
+
+    // Step 4 – Fallback to global minimum if primary search found nothing
+    if (bestTau < 0 && globalBestTau > 0 && globalBestVal < YIN_THR_FALL) {
+        bestTau = globalBestTau;
+        bestVal = globalBestVal;
+    }
+
+    if (bestTau < 0) return { 0.f, 0.f };
+
+    // Step 5 – Octave-error correction: check sub-harmonic at 2*tau.
+    // If the CMNDF at 2*tau is only slightly worse (within YIN_OCTAVE_THR),
+    // prefer it as the true fundamental, since YIN often locks onto the
+    // first harmonic.
+    {
+        int tau2 = bestTau * 2;
+        if (tau2 + 1 < H && tau2 <= maxPer) {
+            // Walk tau2 to its local minimum
+            while (tau2 + 1 < H - 1 && tau2 + 1 <= maxPer && c[tau2 + 1] < c[tau2]) ++tau2;
+            if (tau2 > 0 && tau2 < H - 1 && c[tau2] < bestVal + YIN_OCTAVE_THR) {
+                bestTau = tau2;
+                bestVal = c[tau2];
+            }
+        }
+    }
+
+    // Step 6 – Parabolic interpolation for sub-sample accuracy
+    float shift = parabolicShift(c, bestTau, H);
+    float period = bestTau + shift;
+    if (period < 1.f) return { 0.f, 0.f };
+
+    float hz = (float)sr / period;
+    float confidence = 1.f - bestVal;  // CMNDF dip value inverted: 1.0 = perfect, 0.0 = noise
+    return { hz, std::max(0.f, std::min(1.f, confidence)) };
 }
 
 // ─────────────────────────────────────────────
@@ -209,7 +299,7 @@ float detectBPM(const std::vector<float>& samples, int sr) {
 // ─────────────────────────────────────────────
 //  Pitch Analysis
 // ─────────────────────────────────────────────
-struct PitchFrame { float timeS, hz, midiNote; bool voiced; };
+struct PitchFrame { float timeS, hz, midiNote, confidence; bool voiced; };
 
 float hzToMidi(float hz) { return hz <= 0 ? 0 : 69.f + 12.f * std::log2(hz / 440.f); }
 
@@ -233,6 +323,7 @@ void fillVoicedGaps(std::vector<PitchFrame>& frames, int maxGap = 3, float tol =
                 float t = (float)(j - gs + 1) / (gl + 1);
                 frames[j].midiNote = frames[gs - 1].midiNote * (1 - t) + frames[ge + 1].midiNote * t;
                 frames[j].hz = 440.f * std::pow(2.f, (frames[j].midiNote - 69.f) / 12.f);
+                frames[j].confidence = std::min(frames[gs - 1].confidence, frames[ge + 1].confidence) * 0.7f;
                 frames[j].voiced = true;
             }
         }
@@ -273,14 +364,16 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
         }
     }
 
-    // Pitch frames
-    const int HOP = YIN_WIN / 2;
-    for (int i = 0; i + YIN_WIN <= N; i += HOP) {
+    // Pitch frames (adaptive window size, confidence-based voicing)
+    const int WIN = yinWindowSize(wav.sampleRate);
+    const int HOP = WIN / 2;
+    const float VOICE_CONF_THR = 0.65f;  // minimum YIN confidence to consider voiced
+    for (int i = 0; i + WIN <= N; i += HOP) {
         float t = (float)i / wav.sampleRate;
-        float hz = yinPitch(wav.samples.data() + i, YIN_WIN, wav.sampleRate);
-        float midi = hzToMidi(hz);
-        bool voiced = (hz > 40.f && hz < 2000.f);
-        ta.frames.push_back({ t,hz,midi,voiced });
+        YinResult yr = yinPitch(wav.samples.data() + i, WIN, wav.sampleRate);
+        float midi = hzToMidi(yr.hz);
+        bool voiced = (yr.hz > 55.f && yr.hz < 1800.f && yr.confidence >= VOICE_CONF_THR);
+        ta.frames.push_back({ t, yr.hz, midi, yr.confidence, voiced });
     }
     fillVoicedGaps(ta.frames);
 
