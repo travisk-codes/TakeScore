@@ -15,20 +15,6 @@
 // ─────────────────────────────────────────────
 //  WAV File Parser
 // ─────────────────────────────────────────────
-struct WavHeader {
-    char     riff[4];
-    uint32_t fileSize;
-    char     wave[4];
-    char     fmt[4];
-    uint32_t fmtSize;
-    uint16_t audioFormat;
-    uint16_t numChannels;
-    uint32_t sampleRate;
-    uint32_t byteRate;
-    uint16_t blockAlign;
-    uint16_t bitsPerSample;
-};
-
 
 struct WavFile {
     std::string        filename, shortName;
@@ -51,80 +37,103 @@ WavFile loadWav(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) { wav.error = "Cannot open file"; return wav; }
 
-    WavHeader hdr;
-    f.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
-    if (std::strncmp(hdr.riff, "RIFF", 4) != 0 || std::strncmp(hdr.wave, "WAVE", 4) != 0) {
+    // Read RIFF header (12 bytes)
+    char riffHdr[12];
+    f.read(riffHdr, 12);
+    if (!f || std::strncmp(riffHdr, "RIFF", 4) != 0 || std::strncmp(riffHdr + 8, "WAVE", 4) != 0) {
         wav.error = "Not a valid WAV file"; return wav;
     }
-    // WAVE_FORMAT_EXTENSIBLE (0xFFFE) wraps PCM or float with an extended
-    // header.  The real format tag sits at byte offset 24 of the fmt chunk
-    // (i.e. 8 bytes into the extended area: cbSize(2) + validBits(2) +
-    // channelMask(4), then the first two bytes of the 16-byte SubFormat GUID).
-    uint16_t effectiveFormat = hdr.audioFormat;
-    if (hdr.audioFormat == 0xFFFE && hdr.fmtSize >= 40) {
-        // We already read the first 16 bytes of the fmt chunk (the base
-        // WAVEFORMATEX fields).  The sub-format GUID starts 8 bytes later.
-        // Read cbSize(2) + validBitsPerSample(2) + channelMask(4) + subFormat(2).
-        uint16_t cbSize, validBits;
-        uint32_t channelMask;
-        uint16_t subFormat;
-        f.read(reinterpret_cast<char*>(&cbSize), 2);
-        f.read(reinterpret_cast<char*>(&validBits), 2);
-        f.read(reinterpret_cast<char*>(&channelMask), 4);
-        f.read(reinterpret_cast<char*>(&subFormat), 2);
-        effectiveFormat = subFormat;  // 1 = PCM, 3 = IEEE float
-        // Skip the remaining 14 bytes of the SubFormat GUID + any extra data
-        int consumed = 2 + 2 + 4 + 2;  // 10 bytes read above
-        int remaining = (int)hdr.fmtSize - 16 - consumed;
-        if (remaining > 0) f.seekg(remaining, std::ios::cur);
-    } else if (hdr.fmtSize > 16) {
-        // Non-extensible format with extra fmt bytes (e.g. cbSize for format 3)
-        f.seekg(hdr.fmtSize - 16, std::ios::cur);
+
+    // Scan chunks to find "fmt " and "data".
+    // Many DAWs insert extra chunks (bext, iXML, JUNK, LIST, etc.) before
+    // or between fmt and data, so we cannot assume a fixed layout.
+    uint16_t audioFormat = 0, numChannels = 0, bitsPerSample = 0;
+    uint32_t sampleRate = 0, fmtSize = 0;
+    uint16_t effectiveFormat = 0;
+    bool fmtFound = false;
+    uint32_t dataSize = 0;
+    bool dataFound = false;
+
+    char chunkId[4]; uint32_t chunkSize;
+    while (f.read(chunkId, 4) && f.read(reinterpret_cast<char*>(&chunkSize), 4)) {
+        if (std::strncmp(chunkId, "fmt ", 4) == 0) {
+            fmtSize = chunkSize;
+            auto fmtStart = f.tellg();
+            // Read base WAVEFORMATEX fields (16 bytes)
+            if (fmtSize < 16) { wav.error = "Truncated fmt chunk"; return wav; }
+            f.read(reinterpret_cast<char*>(&audioFormat), 2);
+            f.read(reinterpret_cast<char*>(&numChannels), 2);
+            f.read(reinterpret_cast<char*>(&sampleRate), 4);
+            f.seekg(4, std::ios::cur); // skip byteRate
+            f.seekg(2, std::ios::cur); // skip blockAlign
+            f.read(reinterpret_cast<char*>(&bitsPerSample), 2);
+
+            effectiveFormat = audioFormat;
+            // WAVE_FORMAT_EXTENSIBLE: real format is in the SubFormat GUID
+            if (audioFormat == 0xFFFE && fmtSize >= 40) {
+                f.seekg(2, std::ios::cur); // cbSize
+                f.seekg(2, std::ios::cur); // validBitsPerSample
+                f.seekg(4, std::ios::cur); // channelMask
+                uint16_t subFormat;
+                f.read(reinterpret_cast<char*>(&subFormat), 2);
+                effectiveFormat = subFormat;
+            }
+            // Seek to end of fmt chunk (handles any extra bytes)
+            f.seekg(fmtStart + (std::streamoff)fmtSize);
+            // Word-align
+            if (fmtSize & 1) f.seekg(1, std::ios::cur);
+            fmtFound = true;
+        }
+        else if (std::strncmp(chunkId, "data", 4) == 0) {
+            dataSize = chunkSize;
+            dataFound = true;
+            break; // data chunk body follows — stop scanning
+        }
+        else {
+            // Skip unknown chunk (word-aligned)
+            f.seekg(chunkSize + (chunkSize & 1), std::ios::cur);
+        }
+        if (!f) break;
     }
 
+    if (!fmtFound) { wav.error = "No fmt chunk found"; return wav; }
+    if (!dataFound) { wav.error = "No data chunk found"; return wav; }
     if (effectiveFormat != 1 && effectiveFormat != 3) {
         wav.error = "Unsupported format (code " + std::to_string(effectiveFormat) + ")";
         return wav;
     }
 
-    char chunkId[4]; uint32_t chunkSize;
-    while (f.read(chunkId, 4) && f.read(reinterpret_cast<char*>(&chunkSize), 4)) {
-        if (std::strncmp(chunkId, "data", 4) == 0) break;
-        // WAV chunks are word-aligned: skip an extra byte if chunkSize is odd
-        f.seekg(chunkSize + (chunkSize & 1), std::ios::cur);
-    }
+    wav.sampleRate = sampleRate;
+    wav.numChannels = numChannels;
+    wav.bitsPerSample = bitsPerSample;
 
-    wav.sampleRate = hdr.sampleRate;
-    wav.numChannels = hdr.numChannels;
-    wav.bitsPerSample = hdr.bitsPerSample;
-
-    uint32_t numFrames = chunkSize / (hdr.numChannels * hdr.bitsPerSample / 8);
+    uint32_t numFrames = dataSize / (numChannels * bitsPerSample / 8);
     wav.samples.reserve(numFrames);
     for (uint32_t i = 0; i < numFrames && f.good(); ++i) {
         float mono = 0.f;
-        for (uint16_t ch = 0; ch < hdr.numChannels; ++ch) {
+        for (uint16_t ch = 0; ch < numChannels; ++ch) {
             float s = 0.f;
-            if (hdr.bitsPerSample == 16) {
+            if (bitsPerSample == 16) {
                 int16_t v; f.read(reinterpret_cast<char*>(&v), 2); s = v / 32768.f;
             }
-            else if (hdr.bitsPerSample == 24) {
+            else if (bitsPerSample == 24) {
                 uint8_t b[3]; f.read(reinterpret_cast<char*>(b), 3);
                 int32_t v = (b[2] << 16) | (b[1] << 8) | b[0];
                 if (v & 0x800000) v |= ~0x00FFFFFF; // sign-extend
                 s = v / 8388608.f;
             }
-            else if (hdr.bitsPerSample == 32 && effectiveFormat == 3) {
+            else if (bitsPerSample == 32 && effectiveFormat == 3) {
                 f.read(reinterpret_cast<char*>(&s), 4);
             }
-            else if (hdr.bitsPerSample == 32) {
+            else if (bitsPerSample == 32) {
                 int32_t v; f.read(reinterpret_cast<char*>(&v), 4); s = v / 2147483648.f;
             }
-            else if (hdr.bitsPerSample == 8) {
+            else if (bitsPerSample == 8) {
                 uint8_t v; f.read(reinterpret_cast<char*>(&v), 1); s = (v - 128) / 128.f;
             }
             mono += s;
         }
-        wav.samples.push_back(mono / hdr.numChannels);
+        wav.samples.push_back(mono / numChannels);
     }
     wav.valid = true;
     return wav;
@@ -152,14 +161,56 @@ Scale parseScale(const std::string& keyStr) {
 
     std::string suf = keyStr.substr(consumed);
     for (auto& ch : suf) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-    bool minor = (suf == "m" || suf == "min" || suf == "minor");
 
-    std::vector<int> iv = minor ? std::vector<int>{0, 2, 3, 5, 7, 8, 10}
-    : std::vector<int>{ 0,2,4,5,7,9,11 };
+    // Supported modes/scales:
+    //   maj/major          C D E F G A B         (ionian)
+    //   m/min/minor        C D Eb F G Ab Bb      (aeolian / natural minor)
+    //   dor/dorian         C D Eb F G A Bb       (minor with raised 6th)
+    //   mix/mixolydian     C D E F G A Bb        (major with flat 7th)
+    //   lyd/lydian         C D E F# G A B        (major with raised 4th)
+    //   phry/phrygian      C Db Eb F G Ab Bb     (minor with flat 2nd)
+    //   loc/locrian        C Db Eb F Gb Ab Bb
+    //   pent/pentatonic    C D E G A             (major pentatonic)
+    //   mpent/minpent      C Eb F G Bb           (minor pentatonic)
+    //   blues              C Eb F F# G Bb
+    struct ModeEntry { const char* suffix; std::vector<int> intervals; const char* label; };
+    static const ModeEntry modes[] = {
+        { "dor",          {0,2,3,5,7,9,10},     "dor"  },
+        { "dorian",       {0,2,3,5,7,9,10},     "dor"  },
+        { "mix",          {0,2,4,5,7,9,10},     "mix"  },
+        { "mixolydian",   {0,2,4,5,7,9,10},     "mix"  },
+        { "lyd",          {0,2,4,6,7,9,11},     "lyd"  },
+        { "lydian",       {0,2,4,6,7,9,11},     "lyd"  },
+        { "phry",         {0,1,3,5,7,8,10},     "phry" },
+        { "phrygian",     {0,1,3,5,7,8,10},     "phry" },
+        { "loc",          {0,1,3,5,6,8,10},     "loc"  },
+        { "locrian",      {0,1,3,5,6,8,10},     "loc"  },
+        { "pent",         {0,2,4,7,9},           "pent" },
+        { "pentatonic",   {0,2,4,7,9},           "pent" },
+        { "mpent",        {0,3,5,7,10},          "mpent"},
+        { "minpent",      {0,3,5,7,10},          "mpent"},
+        { "blues",        {0,3,5,6,7,10},        "blues"},
+        { "minor",        {0,2,3,5,7,8,10},     "min"  },
+        { "min",          {0,2,3,5,7,8,10},     "min"  },
+        { "m",            {0,2,3,5,7,8,10},     "min"  },
+        { "major",        {0,2,4,5,7,9,11},     "maj"  },
+        { "maj",          {0,2,4,5,7,9,11},     "maj"  },
+        { "",             {0,2,4,5,7,9,11},     "maj"  },  // default = major
+    };
 
     static const char* nn[] = { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" };
-    sc.name = std::string(nn[root]) + (minor ? "min" : "maj");
-    for (int i : iv) sc.pitchClasses.insert((root + i) % 12);
+    for (const auto& m : modes) {
+        if (suf == m.suffix) {
+            sc.name = std::string(nn[root]) + m.label;
+            for (int i : m.intervals) sc.pitchClasses.insert((root + i) % 12);
+            return sc;
+        }
+    }
+
+    // Fallback: unrecognized suffix → treat as major
+    std::cerr << "Warning: unknown mode '" << suf << "', defaulting to major\n";
+    sc.name = std::string(nn[root]) + "maj";
+    for (int i : {0,2,4,5,7,9,11}) sc.pitchClasses.insert((root + i) % 12);
     return sc;
 }
 
