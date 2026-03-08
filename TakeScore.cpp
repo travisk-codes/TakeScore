@@ -261,131 +261,60 @@ static float parabolicShift(const std::vector<float>& c, int tau, int len) {
     return (s2 - s0) / (2.f * denom);
 }
 
-// hintHz: optional pitch from previous frame for continuity tracking.
-// When provided, if there's a reasonable CMNDF dip near the hint period,
-// prefer it over a slightly-better dip elsewhere.  This prevents YIN from
-// hopping between harmonics frame-to-frame on signals with rich overtones.
-YinResult yinPitch(const float* buf, int N, int sr, float hintHz = 0.f) {
+// ── Multi-candidate YIN (pYIN-style) ──────────────────────────────
+// Instead of returning a single "best" pitch, extract ALL local minima
+// of the CMNDF below a generous threshold.  A downstream Viterbi pass
+// selects the globally optimal path that balances confidence with pitch
+// continuity, naturally resolving octave errors without fragile heuristics.
+
+struct YinCandidate { float hz, confidence; };
+
+static std::vector<YinCandidate> yinCandidates(const float* buf, int N, int sr) {
     int H = N / 2;
-    // Lag range: MIN_PER corresponds to ~2200 Hz, MAX_PER to ~55 Hz
     int minPer = std::max(2, (int)(sr / 2200.f));
     int maxPer = std::min(H - 2, (int)(sr / 55.f));
 
-    // Step 1 – Difference function  d(tau) = sum_j (buf[j] - buf[j+tau])^2
+    // Step 1 – Difference function
     std::vector<float> d(H, 0.f);
     for (int tau = 1; tau < H; ++tau)
         for (int j = 0; j < H; ++j) { float dv = buf[j] - buf[j + tau]; d[tau] += dv * dv; }
 
-    // Step 2 – Cumulative Mean Normalized Difference Function (CMNDF)
+    // Step 2 – CMNDF
     std::vector<float> c(H, 0.f); c[0] = 1.f;
     float rs = 0.f;
     for (int tau = 1; tau < H; ++tau) { rs += d[tau]; c[tau] = d[tau] * tau / (rs + 1e-10f); }
 
-    // Step 3 – Threshold search: find first dip below YIN_THR, then walk to its local minimum.
-    int bestTau = -1;
-    float bestVal = 1e9f;
-    // Also track global best minimum for fallback
-    int globalBestTau = -1;
-    float globalBestVal = 1e9f;
-
+    // Step 3 – Collect all local minima below a generous candidate threshold.
+    // The Viterbi pass will pick the right one; we just need all options.
+    const float CAND_THR = 0.50f;
+    std::vector<YinCandidate> cands;
     for (int tau = minPer; tau <= maxPer; ++tau) {
-        // Track global minimum
-        if (c[tau] < globalBestVal && tau > 0 && tau < H - 1 &&
-            c[tau] <= c[tau - 1] && c[tau] <= c[tau + 1]) {
-            globalBestVal = c[tau];
-            globalBestTau = tau;
+        if (tau <= 0 || tau >= H - 1) continue;
+        if (c[tau] >= CAND_THR) continue;
+        if (c[tau] > c[tau - 1] || c[tau] > c[tau + 1]) continue;
+        // Walk to local minimum
+        while (tau + 1 < H - 1 && tau + 1 <= maxPer && c[tau + 1] < c[tau]) ++tau;
+        float shift = parabolicShift(c, tau, H);
+        float period = tau + shift;
+        if (period < 1.f) continue;
+        float hz = (float)sr / period;
+        if (hz >= 55.f && hz <= 2200.f) {
+            float conf = std::max(0.f, std::min(1.f, 1.f - c[tau]));
+            cands.push_back({ hz, conf });
         }
     }
+    return cands;
+}
 
-    // Primary search: first dip below threshold, walked to local minimum
-    {
-        int tau = minPer;
-        while (tau <= maxPer && tau < H - 1) {
-            if (c[tau] < YIN_THR) {
-                while (tau + 1 < H - 1 && tau + 1 <= maxPer && c[tau + 1] < c[tau]) ++tau;
-                bestTau = tau;
-                bestVal = c[tau];
-                break;
-            }
-            ++tau;
-        }
-    }
-
-    // Step 4 – Fallback to global minimum if primary search found nothing
-    if (bestTau < 0 && globalBestTau > 0 && globalBestVal < YIN_THR_FALL) {
-        bestTau = globalBestTau;
-        bestVal = globalBestVal;
-    }
-
-    if (bestTau < 0) return { 0.f, 0.f };
-
-    // Step 5 – Bidirectional octave-error correction.
-    //
-    // 5a: Octave-up fix (YIN locked onto 2nd harmonic → period is half
-    //     the true fundamental).  Check if 2*tau has a reasonable dip.
-    //     A moderate tolerance of 0.05 lets the true fundamental win when
-    //     it's close, without the false-drop problems of the old 0.15.
-    {
-        int tau2 = bestTau * 2;
-        if (tau2 + 1 < H && tau2 <= maxPer) {
-            // Walk tau2 to its local minimum
-            while (tau2 + 1 < H - 1 && tau2 + 1 <= maxPer && c[tau2 + 1] < c[tau2]) ++tau2;
-            if (tau2 > 0 && tau2 < H - 1 && c[tau2] < bestVal + 0.05f) {
-                bestTau = tau2;
-                bestVal = c[tau2];
-            }
-        }
-    }
-
-    // 5b: Octave-down fix (YIN locked onto sub-harmonic → period is
-    //     double the true fundamental).  Check if tau/2 has a good dip.
-    //     Only prefer it if the dip is below the primary threshold,
-    //     meaning it's a genuine pitch candidate, not just noise.
-    {
-        int tauH = bestTau / 2;
-        if (tauH >= minPer && tauH > 0 && tauH < H - 1) {
-            // Walk to local minimum around tau/2
-            while (tauH - 1 >= minPer && c[tauH - 1] < c[tauH]) --tauH;
-            while (tauH + 1 < H - 1 && tauH + 1 <= maxPer && c[tauH + 1] < c[tauH]) ++tauH;
-            if (tauH > 0 && tauH < H - 1 && c[tauH] < YIN_THR) {
-                bestTau = tauH;
-                bestVal = c[tauH];
-            }
-        }
-    }
-
-    // Step 6 – Pitch-continuity hint: if a previous frame's pitch is
-    // available, check whether there's a good CMNDF dip near the expected
-    // period.  Accept it if its CMNDF is within a small tolerance of the
-    // current best, which prevents harmonic-hopping on sustained notes.
-    if (hintHz > 0.f && bestTau > 0) {
-        int hintTau = (int)(sr / hintHz + 0.5f);
-        // Search ±6% around hint (covers ~1 semitone of drift)
-        int hLo = std::max(minPer, (int)(hintTau * 0.94f));
-        int hHi = std::min(maxPer, std::min(H - 2, (int)(hintTau * 1.06f)));
-        int hBest = -1;
-        float hVal = 1e9f;
-        for (int tau = hLo; tau <= hHi; ++tau) {
-            if (tau > 0 && tau < H - 1 && c[tau] <= c[tau - 1] && c[tau] <= c[tau + 1] && c[tau] < hVal) {
-                hVal = c[tau];
-                hBest = tau;
-            }
-        }
-        // Prefer hint candidate if it's reasonably good (within 0.1 of best)
-        if (hBest > 0 && hVal < bestVal + 0.10f) {
-            bestTau = hBest;
-            bestVal = hVal;
-        }
-    }
-
-    // Step 7 – Parabolic interpolation for sub-sample accuracy
-    float shift = parabolicShift(c, bestTau, H);
-    float period = bestTau + shift;
-    if (period < 1.f) return { 0.f, 0.f };
-
-    float hz = (float)sr / period;
-    float confidence = 1.f - bestVal;  // CMNDF dip value inverted: 1.0 = perfect, 0.0 = noise
-    return { hz, std::max(0.f, std::min(1.f, confidence)) };
+// Single-result wrapper (for any callers that still need it)
+YinResult yinPitch(const float* buf, int N, int sr) {
+    auto cands = yinCandidates(buf, N, sr);
+    if (cands.empty()) return { 0.f, 0.f };
+    // Return highest-confidence candidate
+    int best = 0;
+    for (int i = 1; i < (int)cands.size(); ++i)
+        if (cands[i].confidence > cands[best].confidence) best = i;
+    return { cands[best].hz, cands[best].confidence };
 }
 
 // ─────────────────────────────────────────────
@@ -487,33 +416,108 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
         }
     }
 
-    // Pitch frames (adaptive window size, confidence-based voicing)
+    // ── Multi-candidate pitch extraction + Viterbi path selection ──
+    // Instead of picking one YIN candidate per frame (which causes octave
+    // errors on timbres with strong harmonics), extract ALL reasonable
+    // candidates per frame, then run a Viterbi algorithm to find the
+    // globally optimal pitch path that balances confidence with continuity.
     const int WIN = yinWindowSize(wav.sampleRate);
     const int HOP = WIN / 2;
-    const float VOICE_CONF_THR = 0.65f;  // minimum YIN confidence to consider voiced
-    // RMS energy gate: when the analysis window straddles a note boundary
-    // (half silence, half signal), YIN produces unreliable pitch estimates
-    // that show up as U-shaped dips at note onsets/offsets.  Computing
-    // per-window RMS and requiring a minimum energy level cleanly trims
-    // these garbage frames.
-    const float RMS_GATE = 0.005f;  // ~-46 dBFS — below this is silence/noise
-    float prevVoicedHz = 0.f;  // pitch continuity hint for YIN
+    const float VOICE_CONF_THR = 0.65f;
+    const float RMS_GATE = 0.005f;
+
+    // Phase 1: extract candidates per frame
+    struct FrameCands { std::vector<YinCandidate> cands; bool hasEnergy; float timeS; };
+    std::vector<FrameCands> allCands;
     for (int i = 0; i + WIN <= N; i += HOP) {
         float t = (float)i / wav.sampleRate;
-        // Per-window RMS
         float winRms = 0.f;
         for (int j = i; j < i + WIN; ++j) winRms += wav.samples[j] * wav.samples[j];
         winRms = std::sqrt(winRms / WIN);
         if (winRms < RMS_GATE) {
-            ta.frames.push_back({ t, 0.f, 0.f, 0.f, false });
-            prevVoicedHz = 0.f;  // reset hint on silence
+            allCands.push_back({ {}, false, t });
             continue;
         }
-        YinResult yr = yinPitch(wav.samples.data() + i, WIN, wav.sampleRate, prevVoicedHz);
-        float midi = hzToMidi(yr.hz);
-        bool voiced = (yr.hz > 55.f && yr.hz < 1800.f && yr.confidence >= VOICE_CONF_THR);
-        if (voiced) prevVoicedHz = yr.hz;
-        ta.frames.push_back({ t, yr.hz, midi, yr.confidence, voiced });
+        auto cands = yinCandidates(wav.samples.data() + i, WIN, wav.sampleRate);
+        allCands.push_back({ std::move(cands), true, t });
+    }
+
+    // Phase 2: Viterbi path selection
+    // Cost = observation (1-confidence) + transition (penalise pitch jumps)
+    int NF = (int)allCands.size();
+    // Per-frame, per-candidate: cumulative cost and back-pointer
+    std::vector<std::vector<float>> vCost(NF);
+    std::vector<std::vector<int>>   vBack(NF);  // index into previous frame's candidates
+    std::vector<std::vector<int>>   vPrev(NF);  // which previous frame
+
+    for (int i = 0; i < NF; ++i) {
+        int nc = (int)allCands[i].cands.size();
+        if (!allCands[i].hasEnergy || nc == 0) continue;
+        vCost[i].resize(nc, 1e9f);
+        vBack[i].resize(nc, -1);
+        vPrev[i].resize(nc, -1);
+
+        // Find nearest previous frame that has candidates
+        int pi = i - 1;
+        while (pi >= 0 && vCost[pi].empty()) --pi;
+
+        for (int j = 0; j < nc; ++j) {
+            float obs = 1.f - allCands[i].cands[j].confidence;
+            if (pi < 0 || vCost[pi].empty()) {
+                // No predecessor — just observation cost
+                vCost[i][j] = obs;
+            } else {
+                float midiJ = hzToMidi(allCands[i].cands[j].hz);
+                int npc = (int)vCost[pi].size();
+                for (int k = 0; k < npc; ++k) {
+                    float midiK = hzToMidi(allCands[pi].cands[k].hz);
+                    float diff = std::abs(midiJ - midiK);
+                    // Transition cost: 0 for <1 semitone, then 0.05/semitone.
+                    // A 12-semitone (octave) jump costs 0.55 — large enough
+                    // that the octave candidate must be vastly more confident
+                    // to win, but real note transitions (with high confidence
+                    // at both pitches) still come through.
+                    float trans = (diff > 1.f) ? (diff - 1.f) * 0.05f : 0.f;
+                    float total = vCost[pi][k] + trans + obs;
+                    if (total < vCost[i][j]) {
+                        vCost[i][j] = total;
+                        vBack[i][j] = k;
+                        vPrev[i][j] = pi;
+                    }
+                }
+            }
+        }
+    }
+
+    // Backtrace: find best final candidate, walk backwards
+    std::vector<int> bestIdx(NF, -1);
+    int last = NF - 1;
+    while (last >= 0 && vCost[last].empty()) --last;
+    if (last >= 0) {
+        int best = 0;
+        for (int j = 1; j < (int)vCost[last].size(); ++j)
+            if (vCost[last][j] < vCost[last][best]) best = j;
+        bestIdx[last] = best;
+        for (int i = last; i >= 0; ) {
+            if (bestIdx[i] < 0 || vBack[i].empty()) { --i; continue; }
+            int pi = vPrev[i][bestIdx[i]];
+            if (pi >= 0 && vBack[i][bestIdx[i]] >= 0)
+                bestIdx[pi] = vBack[i][bestIdx[i]];
+            i = pi >= 0 ? pi : i - 1;
+        }
+    }
+
+    // Phase 3: build PitchFrame vector from Viterbi selections
+    for (int i = 0; i < NF; ++i) {
+        float t = allCands[i].timeS;
+        if (!allCands[i].hasEnergy || allCands[i].cands.empty() || bestIdx[i] < 0) {
+            ta.frames.push_back({ t, 0.f, 0.f, 0.f, false });
+        } else {
+            auto& c = allCands[i].cands[bestIdx[i]];
+            float midi = hzToMidi(c.hz);
+            bool voiced = (c.hz > 55.f && c.hz < 1800.f && c.confidence >= VOICE_CONF_THR);
+            ta.frames.push_back({ t, c.hz, midi, c.confidence, voiced });
+        }
     }
     fillVoicedGaps(ta.frames);
 
