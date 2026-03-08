@@ -404,13 +404,15 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
         fillVoicedGaps(ta.frames);
     }
 
-    // Gaussian smoothing of MIDI values.
-    // Reduces frame-to-frame YIN estimation noise while preserving the shape
-    // of slow continuous pitch movements (e.g. sirens, slides, vibrato).
-    // Smoothing is done in MIDI (log-Hz) space so perceptual intervals are
-    // weighted uniformly. Never bridges voiced/unvoiced boundaries.
-    // SIGMA is defined in *seconds* (~185 ms) and converted to frames so
-    // the smoothing width stays consistent regardless of window/hop size.
+    // Note-boundary-aware Gaussian smoothing of MIDI values.
+    // Reduces frame-to-frame YIN jitter while keeping each sustained note
+    // as a clean horizontal line.  The key insight: only include neighbouring
+    // frames in the Gaussian kernel when they round to the SAME nearest
+    // semitone as the centre frame.  This prevents smoothing from bleeding
+    // across note transitions (which was pulling the tail of each note
+    // toward the next note's pitch, creating visible slopes).
+    // SIGMA is defined in seconds and converted to frames for consistency
+    // across different sample rates / window sizes.
     {
         const float SIGMA_SEC = 0.185f;
         const float frameDurS = (float)HOP / wav.sampleRate;
@@ -421,9 +423,12 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
         std::vector<bool>  smoothValid(NF, false);
         for (int i = 0; i < NF; ++i) {
             if (!ta.frames[i].voiced) continue;
+            float centerNote = std::round(ta.frames[i].midiNote);
             float wsum = 0.f, vsum = 0.f;
             for (int j = std::max(0, i - HW); j <= std::min(NF - 1, i + HW); ++j) {
                 if (!ta.frames[j].voiced) continue;
+                // Only include frames on the same nearest semitone
+                if (std::round(ta.frames[j].midiNote) != centerNote) continue;
                 float d = (float)(j - i);
                 float w = std::exp(-0.5f * (d / SIGMA) * (d / SIGMA));
                 vsum += w * ta.frames[j].midiNote;
