@@ -166,10 +166,12 @@ static const float YIN_OCTAVE_THR = 0.15f;  // CMNDF penalty tolerance for sub-h
 
 struct YinResult { float hz; float confidence; };
 
-// Adaptive window: ~46 ms at any sample rate (2048 @ 44100, 4096 @ 96000, etc.)
+// Adaptive window: 2048 @ 44100/48000, 4096 @ 88200/96000, etc.
 // Rounded up to next power of two for cache-friendliness.
+// Using 0.042s keeps standard rates at 2048 while only bumping to 4096
+// for high-res sessions (88.2k+).
 static int yinWindowSize(int sr) {
-    int target = (int)(sr * 0.047f); // ~47 ms
+    int target = (int)(sr * 0.042f);
     int w = 256;
     while (w < target) w <<= 1;
     return w;
@@ -407,11 +409,12 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
     // of slow continuous pitch movements (e.g. sirens, slides, vibrato).
     // Smoothing is done in MIDI (log-Hz) space so perceptual intervals are
     // weighted uniformly. Never bridges voiced/unvoiced boundaries.
-    // HOP = YIN_WIN/2 = 1024 samples, so at 44.1 kHz each frame is ~23 ms.
-    // SIGMA=12 frames => ~280 ms half-width. Raise toward 20 for more smoothness,
-    // lower toward 4 to preserve fast ornaments like trills.
+    // SIGMA is defined in *seconds* (~185 ms) and converted to frames so
+    // the smoothing width stays consistent regardless of window/hop size.
     {
-        const float SIGMA = 8.0f;
+        const float SIGMA_SEC = 0.185f;
+        const float frameDurS = (float)HOP / wav.sampleRate;
+        const float SIGMA = SIGMA_SEC / frameDurS;  // ~8 frames at 44.1k/2048 window
         const int   HW = (int)(SIGMA * 3.f + 0.5f);
         int NF = (int)ta.frames.size();
         std::vector<float> smoothed(NF, 0.f);
