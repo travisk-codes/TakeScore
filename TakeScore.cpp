@@ -237,12 +237,15 @@ static const float YIN_THR_FALL  = 0.30f;   // fallback: accept global minimum u
 
 struct YinResult { float hz; float confidence; };
 
-// Adaptive window: 2048 @ 44100/48000, 4096 @ 88200/96000, etc.
+// Adaptive window: 4096 @ 44100/48000, 8192 @ 88200/96000, etc.
 // Rounded up to next power of two for cache-friendliness.
-// Using 0.042s keeps standard rates at 2048 while only bumping to 4096
-// for high-res sessions (88.2k+).
+// Using 0.085s (~4096 @ 44.1k) gives YIN ~10 periods for notes around
+// A#3 (233 Hz), producing much more reliable CMNDF dips at the true
+// fundamental.  The old 0.042s (2048) only gave ~5 periods, causing
+// YIN to frequently lock onto harmonics on synth timbres with strong
+// overtones.
 static int yinWindowSize(int sr) {
-    int target = (int)(sr * 0.042f);
+    int target = (int)(sr * 0.085f);
     int w = 256;
     while (w < target) w <<= 1;
     return w;
@@ -316,18 +319,37 @@ YinResult yinPitch(const float* buf, int N, int sr, float hintHz = 0.f) {
 
     if (bestTau < 0) return { 0.f, 0.f };
 
-    // Step 5 – Octave-error correction: check sub-harmonic at 2*tau.
-    // Only prefer it when 2*tau has a strictly *better* (lower) CMNDF dip.
-    // The old "within tolerance" approach was too aggressive — it caused
-    // false octave drops on synths and instruments with strong harmonics.
+    // Step 5 – Bidirectional octave-error correction.
+    //
+    // 5a: Octave-up fix (YIN locked onto 2nd harmonic → period is half
+    //     the true fundamental).  Check if 2*tau has a reasonable dip.
+    //     A moderate tolerance of 0.05 lets the true fundamental win when
+    //     it's close, without the false-drop problems of the old 0.15.
     {
         int tau2 = bestTau * 2;
         if (tau2 + 1 < H && tau2 <= maxPer) {
             // Walk tau2 to its local minimum
             while (tau2 + 1 < H - 1 && tau2 + 1 <= maxPer && c[tau2 + 1] < c[tau2]) ++tau2;
-            if (tau2 > 0 && tau2 < H - 1 && c[tau2] < bestVal) {
+            if (tau2 > 0 && tau2 < H - 1 && c[tau2] < bestVal + 0.05f) {
                 bestTau = tau2;
                 bestVal = c[tau2];
+            }
+        }
+    }
+
+    // 5b: Octave-down fix (YIN locked onto sub-harmonic → period is
+    //     double the true fundamental).  Check if tau/2 has a good dip.
+    //     Only prefer it if the dip is below the primary threshold,
+    //     meaning it's a genuine pitch candidate, not just noise.
+    {
+        int tauH = bestTau / 2;
+        if (tauH >= minPer && tauH > 0 && tauH < H - 1) {
+            // Walk to local minimum around tau/2
+            while (tauH - 1 >= minPer && c[tauH - 1] < c[tauH]) --tauH;
+            while (tauH + 1 < H - 1 && tauH + 1 <= maxPer && c[tauH + 1] < c[tauH]) ++tauH;
+            if (tauH > 0 && tauH < H - 1 && c[tauH] < YIN_THR) {
+                bestTau = tauH;
+                bestVal = c[tauH];
             }
         }
     }
