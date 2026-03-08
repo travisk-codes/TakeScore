@@ -234,7 +234,6 @@ Scale parseScale(const std::string& keyStr) {
 
 static const float YIN_THR       = 0.12f;   // primary CMNDF threshold (slightly tighter)
 static const float YIN_THR_FALL  = 0.30f;   // fallback: accept global minimum up to this
-static const float YIN_OCTAVE_THR = 0.15f;  // CMNDF penalty tolerance for sub-harmonic check
 
 struct YinResult { float hz; float confidence; };
 
@@ -314,15 +313,15 @@ YinResult yinPitch(const float* buf, int N, int sr) {
     if (bestTau < 0) return { 0.f, 0.f };
 
     // Step 5 – Octave-error correction: check sub-harmonic at 2*tau.
-    // If the CMNDF at 2*tau is only slightly worse (within YIN_OCTAVE_THR),
-    // prefer it as the true fundamental, since YIN often locks onto the
-    // first harmonic.
+    // Only prefer it when 2*tau has a strictly *better* (lower) CMNDF dip.
+    // The old "within tolerance" approach was too aggressive — it caused
+    // false octave drops on synths and instruments with strong harmonics.
     {
         int tau2 = bestTau * 2;
         if (tau2 + 1 < H && tau2 <= maxPer) {
             // Walk tau2 to its local minimum
             while (tau2 + 1 < H - 1 && tau2 + 1 <= maxPer && c[tau2 + 1] < c[tau2]) ++tau2;
-            if (tau2 > 0 && tau2 < H - 1 && c[tau2] < bestVal + YIN_OCTAVE_THR) {
+            if (tau2 > 0 && tau2 < H - 1 && c[tau2] < bestVal) {
                 bestTau = tau2;
                 bestVal = c[tau2];
             }
@@ -442,8 +441,22 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
     const int WIN = yinWindowSize(wav.sampleRate);
     const int HOP = WIN / 2;
     const float VOICE_CONF_THR = 0.65f;  // minimum YIN confidence to consider voiced
+    // RMS energy gate: when the analysis window straddles a note boundary
+    // (half silence, half signal), YIN produces unreliable pitch estimates
+    // that show up as U-shaped dips at note onsets/offsets.  Computing
+    // per-window RMS and requiring a minimum energy level cleanly trims
+    // these garbage frames.
+    const float RMS_GATE = 0.005f;  // ~-46 dBFS — below this is silence/noise
     for (int i = 0; i + WIN <= N; i += HOP) {
         float t = (float)i / wav.sampleRate;
+        // Per-window RMS
+        float winRms = 0.f;
+        for (int j = i; j < i + WIN; ++j) winRms += wav.samples[j] * wav.samples[j];
+        winRms = std::sqrt(winRms / WIN);
+        if (winRms < RMS_GATE) {
+            ta.frames.push_back({ t, 0.f, 0.f, 0.f, false });
+            continue;
+        }
         YinResult yr = yinPitch(wav.samples.data() + i, WIN, wav.sampleRate);
         float midi = hzToMidi(yr.hz);
         bool voiced = (yr.hz > 55.f && yr.hz < 1800.f && yr.confidence >= VOICE_CONF_THR);
