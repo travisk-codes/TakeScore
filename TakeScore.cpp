@@ -461,8 +461,21 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
         int pi = i - 1;
         while (pi >= 0 && vCost[pi].empty()) --pi;
 
+        // Sub-harmonic penalty: candidates are sorted by ascending tau
+        // (descending Hz). The first candidate is the fundamental (shortest
+        // period with a good CMNDF dip). Subsequent candidates at 2T, 3T,
+        // 4T etc. are sub-harmonics that are ALWAYS present for any periodic
+        // signal and often have even better CMNDF due to cumulative
+        // normalization. Without this penalty the Viterbi would always
+        // pick the lowest sub-harmonic since it has the best observation
+        // cost and zero transition cost across frames.
+        // Penalty = 0.3 per octave below the first candidate.
+        float topHz = nc > 0 ? allCands[i].cands[0].hz : 1.f;
         for (int j = 0; j < nc; ++j) {
-            float obs = 1.f - allCands[i].cands[j].confidence;
+            float subHarmPenalty = 0.f;
+            if (j > 0 && allCands[i].cands[j].hz > 0.f)
+                subHarmPenalty = std::log2(topHz / allCands[i].cands[j].hz) * 0.3f;
+            float obs = (1.f - allCands[i].cands[j].confidence) + subHarmPenalty;
             if (pi < 0 || vCost[pi].empty()) {
                 // No predecessor — just observation cost
                 vCost[i][j] = obs;
