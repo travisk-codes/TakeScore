@@ -258,7 +258,11 @@ static float parabolicShift(const std::vector<float>& c, int tau, int len) {
     return (s2 - s0) / (2.f * denom);
 }
 
-YinResult yinPitch(const float* buf, int N, int sr) {
+// hintHz: optional pitch from previous frame for continuity tracking.
+// When provided, if there's a reasonable CMNDF dip near the hint period,
+// prefer it over a slightly-better dip elsewhere.  This prevents YIN from
+// hopping between harmonics frame-to-frame on signals with rich overtones.
+YinResult yinPitch(const float* buf, int N, int sr, float hintHz = 0.f) {
     int H = N / 2;
     // Lag range: MIN_PER corresponds to ~2200 Hz, MAX_PER to ~55 Hz
     int minPer = std::max(2, (int)(sr / 2200.f));
@@ -328,7 +332,31 @@ YinResult yinPitch(const float* buf, int N, int sr) {
         }
     }
 
-    // Step 6 – Parabolic interpolation for sub-sample accuracy
+    // Step 6 – Pitch-continuity hint: if a previous frame's pitch is
+    // available, check whether there's a good CMNDF dip near the expected
+    // period.  Accept it if its CMNDF is within a small tolerance of the
+    // current best, which prevents harmonic-hopping on sustained notes.
+    if (hintHz > 0.f && bestTau > 0) {
+        int hintTau = (int)(sr / hintHz + 0.5f);
+        // Search ±6% around hint (covers ~1 semitone of drift)
+        int hLo = std::max(minPer, (int)(hintTau * 0.94f));
+        int hHi = std::min(maxPer, std::min(H - 2, (int)(hintTau * 1.06f)));
+        int hBest = -1;
+        float hVal = 1e9f;
+        for (int tau = hLo; tau <= hHi; ++tau) {
+            if (tau > 0 && tau < H - 1 && c[tau] <= c[tau - 1] && c[tau] <= c[tau + 1] && c[tau] < hVal) {
+                hVal = c[tau];
+                hBest = tau;
+            }
+        }
+        // Prefer hint candidate if it's reasonably good (within 0.1 of best)
+        if (hBest > 0 && hVal < bestVal + 0.10f) {
+            bestTau = hBest;
+            bestVal = hVal;
+        }
+    }
+
+    // Step 7 – Parabolic interpolation for sub-sample accuracy
     float shift = parabolicShift(c, bestTau, H);
     float period = bestTau + shift;
     if (period < 1.f) return { 0.f, 0.f };
@@ -447,6 +475,7 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
     // per-window RMS and requiring a minimum energy level cleanly trims
     // these garbage frames.
     const float RMS_GATE = 0.005f;  // ~-46 dBFS — below this is silence/noise
+    float prevVoicedHz = 0.f;  // pitch continuity hint for YIN
     for (int i = 0; i + WIN <= N; i += HOP) {
         float t = (float)i / wav.sampleRate;
         // Per-window RMS
@@ -455,11 +484,13 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
         winRms = std::sqrt(winRms / WIN);
         if (winRms < RMS_GATE) {
             ta.frames.push_back({ t, 0.f, 0.f, 0.f, false });
+            prevVoicedHz = 0.f;  // reset hint on silence
             continue;
         }
-        YinResult yr = yinPitch(wav.samples.data() + i, WIN, wav.sampleRate);
+        YinResult yr = yinPitch(wav.samples.data() + i, WIN, wav.sampleRate, prevVoicedHz);
         float midi = hzToMidi(yr.hz);
         bool voiced = (yr.hz > 55.f && yr.hz < 1800.f && yr.confidence >= VOICE_CONF_THR);
+        if (voiced) prevVoicedHz = yr.hz;
         ta.frames.push_back({ t, yr.hz, midi, yr.confidence, voiced });
     }
     fillVoicedGaps(ta.frames);
@@ -489,38 +520,36 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
         fillVoicedGaps(ta.frames);
     }
 
-    // Gaussian smoothing of MIDI values.
-    // Reduces frame-to-frame YIN estimation noise while preserving natural
-    // pitch movement (vibrato, portamento, slides).
-    // A short SIGMA (~70 ms ≈ 3 frames at 44.1k) cleans up per-frame YIN
-    // jitter without being wide enough to pull sustained notes toward their
-    // neighbors.  Never bridges voiced/unvoiced boundaries.
-    // SIGMA is defined in seconds and converted to frames for consistency
-    // across different sample rates / window sizes.
+    // Median filter on MIDI values.
+    // Unlike Gaussian smoothing (which averages and can blend correct frames
+    // with octave-error frames, producing smooth but wrong curves), a median
+    // filter is robust to outliers — it selects the middle value, so a few
+    // bad frames among many good ones are simply ignored.
+    // Half-width of ~3 frames (~70 ms at 44.1k) is enough to reject
+    // isolated YIN misfires without smearing real note transitions.
+    // Never bridges voiced/unvoiced boundaries.
     {
-        const float SIGMA_SEC = 0.070f;
+        const float MF_SEC = 0.070f;
         const float frameDurS = (float)HOP / wav.sampleRate;
-        const float SIGMA = std::max(1.5f, SIGMA_SEC / frameDurS);  // ~3 frames at 44.1k
-        const int   HW = (int)(SIGMA * 3.f + 0.5f);
+        const int   HW = std::max(1, (int)(MF_SEC / frameDurS + 0.5f));
         int NF = (int)ta.frames.size();
-        std::vector<float> smoothed(NF, 0.f);
-        std::vector<bool>  smoothValid(NF, false);
+        std::vector<float> filtered(NF, 0.f);
+        std::vector<bool>  filtValid(NF, false);
         for (int i = 0; i < NF; ++i) {
             if (!ta.frames[i].voiced) continue;
-            float wsum = 0.f, vsum = 0.f;
+            std::vector<float> win;
             for (int j = std::max(0, i - HW); j <= std::min(NF - 1, i + HW); ++j) {
-                if (!ta.frames[j].voiced) continue;
-                float d = (float)(j - i);
-                float w = std::exp(-0.5f * (d / SIGMA) * (d / SIGMA));
-                vsum += w * ta.frames[j].midiNote;
-                wsum += w;
+                if (ta.frames[j].voiced) win.push_back(ta.frames[j].midiNote);
             }
-            if (wsum > 0.f) { smoothed[i] = vsum / wsum; smoothValid[i] = true; }
+            if (win.empty()) continue;
+            std::sort(win.begin(), win.end());
+            filtered[i] = win[win.size() / 2];
+            filtValid[i] = true;
         }
         for (int i = 0; i < NF; ++i) {
-            if (!smoothValid[i]) continue;
-            ta.frames[i].midiNote = smoothed[i];
-            ta.frames[i].hz = 440.f * std::pow(2.f, (smoothed[i] - 69.f) / 12.f);
+            if (!filtValid[i]) continue;
+            ta.frames[i].midiNote = filtered[i];
+            ta.frames[i].hz = 440.f * std::pow(2.f, (filtered[i] - 69.f) / 12.f);
         }
     }
 
