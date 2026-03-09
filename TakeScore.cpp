@@ -13,8 +13,12 @@
 #include <set>
 #include <cerrno>
 
+#ifdef HAS_SNDFILE
+#include <sndfile.h>
+#endif
+
 // ─────────────────────────────────────────────
-//  WAV File Parser
+//  Audio File Loading
 // ─────────────────────────────────────────────
 
 struct WavFile {
@@ -136,7 +140,7 @@ WavFile loadWav(const std::string& path) {
     wav.numChannels = numChannels;
     wav.bitsPerSample = bitsPerSample;
 
-    int bytesPerFrame = numChannels * bitsPerSample / 8;
+    int bytesPerFrame = numChannels * (bitsPerSample / 8);
     uint64_t numFrames = (bytesPerFrame > 0) ? dataSize64 / bytesPerFrame : 0;
     wav.samples.reserve((size_t)std::min(numFrames, (uint64_t)500000000ULL));
     for (uint64_t i = 0; i < numFrames && f.good(); ++i) {
@@ -149,7 +153,7 @@ WavFile loadWav(const std::string& path) {
             else if (bitsPerSample == 24) {
                 uint8_t b[3]; f.read(reinterpret_cast<char*>(b), 3);
                 int32_t v = (b[2] << 16) | (b[1] << 8) | b[0];
-                if (v & 0x800000) v |= ~0x00FFFFFF; // sign-extend
+                if (v & 0x800000) v |= (int32_t)0xFF000000; // sign-extend
                 s = v / 8388608.f;
             }
             else if (bitsPerSample == 32 && effectiveFormat == 3) {
@@ -167,6 +171,65 @@ WavFile loadWav(const std::string& path) {
     }
     wav.valid = true;
     return wav;
+}
+
+#ifdef HAS_SNDFILE
+WavFile loadSndfile(const std::string& path) {
+    WavFile wav;
+    wav.filename = path;
+    size_t slash = path.find_last_of("/\\");
+    std::string name = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    size_t dot = name.find_last_of('.');
+    wav.shortName = (dot == std::string::npos) ? name : name.substr(0, dot);
+
+    SF_INFO info = {};
+    SNDFILE* sf = sf_open(path.c_str(), SFM_READ, &info);
+    if (!sf) {
+        wav.error = sf_strerror(nullptr);
+        return wav;
+    }
+    wav.sampleRate = info.samplerate;
+    wav.numChannels = info.channels;
+    wav.bitsPerSample = 0; // not meaningful for compressed formats
+
+    // Read interleaved float samples and mix to mono
+    const int BLOCK = 4096;
+    std::vector<float> buf(BLOCK * info.channels);
+    wav.samples.reserve(std::min((sf_count_t)500000000LL, info.frames));
+    sf_count_t read;
+    while ((read = sf_readf_float(sf, buf.data(), BLOCK)) > 0) {
+        for (sf_count_t i = 0; i < read; ++i) {
+            float mono = 0.f;
+            for (int ch = 0; ch < info.channels; ++ch)
+                mono += buf[i * info.channels + ch];
+            wav.samples.push_back(mono / info.channels);
+        }
+    }
+    sf_close(sf);
+    wav.valid = true;
+    return wav;
+}
+#endif
+
+static bool endsWith(const std::string& s, const std::string& suffix) {
+    if (suffix.size() > s.size()) return false;
+    return std::equal(suffix.rbegin(), suffix.rend(), s.rbegin(),
+        [](char a, char b) { return std::tolower((unsigned char)a) == std::tolower((unsigned char)b); });
+}
+
+WavFile loadAudio(const std::string& path) {
+#ifdef HAS_SNDFILE
+    // Use libsndfile for non-WAV formats (and as fallback for WAV)
+    if (!endsWith(path, ".wav")) return loadSndfile(path);
+#else
+    if (endsWith(path, ".mp3") || endsWith(path, ".flac") || endsWith(path, ".ogg") || endsWith(path, ".aiff")) {
+        WavFile wav;
+        wav.filename = path;
+        wav.error = "Unsupported format (compile with -DHAS_SNDFILE -lsndfile for MP3/FLAC/OGG support)";
+        return wav;
+    }
+#endif
+    return loadWav(path);
 }
 
 // ─────────────────────────────────────────────
@@ -886,7 +949,17 @@ void generateReport(const std::vector<TakeAnalysis>& takes,
     W(".lsw.nt{background:rgba(255,255,255,.28)}\n");
     W(".lsw.pt{background:#d0d0d0}\n");
     W(".lsw.sc{background:rgba(59,130,246,.55)}\n");
+    W(".lsw.ov{background:rgba(168,85,247,.7)}\n");
     W(".hint{margin-left:auto;opacity:.4;font-size:9px}\n");
+    // A/B overlay
+    W(".ab-wrap{position:relative;display:flex;align-items:stretch}\n");
+    W(".ab-btn{background:none;border:none;border-right:1px solid var(--border);color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:10px;padding:0 9px;cursor:pointer;transition:color .1s}\n");
+    W(".ab-btn:hover,.ab-btn.on{color:var(--acc)}\n");
+    W(".ab-menu{display:none;position:absolute;top:100%;left:0;background:var(--s1);border:1px solid var(--border2);border-radius:3px;z-index:20;min-width:120px;padding:2px 0}\n");
+    W(".ab-menu.show{display:block}\n");
+    W(".ab-opt{display:block;width:100%;background:none;border:none;color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:10px;padding:4px 10px;cursor:pointer;text-align:left}\n");
+    W(".ab-opt:hover{background:var(--s2);color:var(--text)}\n");
+    W(".ab-opt.sel{color:var(--acc)}\n");
     W(".note-acc{display:flex;gap:4px;padding:4px 10px;border-bottom:1px solid var(--border);flex-shrink:0;flex-wrap:wrap;align-items:center;min-height:22px}\n");
     W(".na{padding:1px 6px;border-radius:2px;border:1px solid;font-family:'IBM Plex Mono',monospace;font-size:9px}\n");
     W("</style></head><body>\n");
@@ -926,6 +999,7 @@ void generateReport(const std::vector<TakeAnalysis>& takes,
     W("<div class=\"rpanel\">\n");
     W("  <div class=\"toolbar\">\n");
     W("    <div class=\"tabs\" id=\"tabs\"></div>\n");
+    W("    <div class=\"ab-wrap\"><button class=\"ab-btn\" id=\"ab-btn\">A/B</button><div class=\"ab-menu\" id=\"ab-menu\"></div></div>\n");
     W("    <div class=\"sbar\">\n");
     W("      <div class=\"si\"><span class=\"l\">acc</span><span class=\"v\" id=\"si-acc\"></span></div>\n");
     W("      <div class=\"si\"><span class=\"l\">+/-c</span><span class=\"v\" id=\"si-cents\"></span></div>\n");
@@ -948,6 +1022,7 @@ void generateReport(const std::vector<TakeAnalysis>& takes,
     W("    <span class=\"leg\"><span class=\"lsw pt\"></span>detected pitch</span>\n");
     if (!scale.name.empty()) W("    <span class=\"leg\"><span class=\"lsw sc\"></span>scale note</span>\n");
     if (bpm > 0) W("    <span class=\"leg\"><span class=\"lsw nt\"></span>beat/bar</span>\n");
+    W("    <span class=\"leg\" id=\"leg-overlay\" style=\"display:none\"><span class=\"lsw ov\"></span>overlay (B)</span>\n");
     W("    <span class=\"hint\">scroll=zoom H &nbsp;|&nbsp; shift+scroll=zoom V &nbsp;|&nbsp; drag chart=pan &nbsp;|&nbsp; drag overview=pan &nbsp;|&nbsp; dbl-click=reset &nbsp;|&nbsp; &larr;&rarr;=take &nbsp;|&nbsp; R=reset</span>\n");
     W("  </div>\n</div>\n</div>\n</div>\n");
 
@@ -1044,7 +1119,7 @@ function updateStats(ti){
   const voiced=t.frames.filter(f=>f.v);
   const avgHz=voiced.length?(voiced.reduce((s,f)=>s+f.hz,0)/voiced.length).toFixed(0):' - ';
   document.getElementById('si-acc').textContent=f1(t.pitchAccuracyScore);
-  document.getElementById('si-cents').textContent='+/-'+f1(t.avgCentsOff)+'c';
+  document.getElementById('si-cents').textContent=f1(t.avgCentsOff)+'c';
   document.getElementById('si-stab').textContent=f1(t.stabilityScore);
   document.getElementById('si-voiced').textContent=(t.voicedRatio*100).toFixed(0)+'%';
   document.getElementById('si-dur').textContent=fmtDur(t.duration);
@@ -1074,11 +1149,39 @@ TAKES.forEach((t,ti)=>{
 
 function switchTake(ti){
   ati=ti;
+  if(bti===ti){bti=-1;document.getElementById('ab-btn').classList.remove('on');document.getElementById('leg-overlay').style.display='none';}
   document.querySelectorAll('.tab').forEach((b,i)=>b.classList.toggle('active',i===ti));
   updateStats(ti);
   redraw();
 }
 updateStats(0);
+
+// -- A/B overlay -----------------------------------------------
+let bti=-1; // B take index, -1 = off
+const abBtn=document.getElementById('ab-btn');
+const abMenu=document.getElementById('ab-menu');
+function buildABMenu(){
+  abMenu.innerHTML='';
+  const off=document.createElement('button');
+  off.className='ab-opt'+(bti<0?' sel':'');
+  off.textContent='Off';
+  off.addEventListener('click',()=>{bti=-1;abBtn.classList.remove('on');abMenu.classList.remove('show');document.getElementById('leg-overlay').style.display='none';redraw();});
+  abMenu.appendChild(off);
+  TAKES.forEach((t,i)=>{
+    if(i===ati)return;
+    const opt=document.createElement('button');
+    opt.className='ab-opt'+(i===bti?' sel':'');
+    opt.textContent=t.name;
+    opt.addEventListener('click',()=>{bti=i;abBtn.classList.add('on');abMenu.classList.remove('show');document.getElementById('leg-overlay').style.display='';redraw();});
+    abMenu.appendChild(opt);
+  });
+}
+abBtn.addEventListener('click',e=>{
+  e.stopPropagation();
+  buildABMenu();
+  abMenu.classList.toggle('show');
+});
+document.addEventListener('click',()=>abMenu.classList.remove('show'));
 
 // -- State variables ------------------------------------------
 let hovBin=null;
@@ -1208,6 +1311,19 @@ function drawPitch(){
   }
   flR();
   ctx.setLineDash([]);
+
+  // A/B overlay pitch line (drawn behind main pitch line)
+  if(bti>=0&&bti<TAKES.length){
+    const bFrames=TAKES[bti].frames;
+    ctx.strokeStyle='rgba(168,85,247,0.6)';ctx.lineWidth=1.5;ctx.lineJoin='round';
+    let bOpen=false;ctx.beginPath();
+    for(const f of bFrames){
+      if(!f.v||f.t<vp.t0-.05||f.t>vp.t1+.05){bOpen=false;continue;}
+      const x=tX(f.t),y=mY(f.midi);
+      if(!bOpen){ctx.moveTo(x,y);bOpen=true;}else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+  }
 
   // Pitch line
   ctx.strokeStyle='#d0d0d0';ctx.lineWidth=1.5;ctx.lineJoin='round';
@@ -1606,7 +1722,7 @@ void printSummary(const std::vector<TakeAnalysis>& takes) {
 // ---------------------------------------------
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage: take_analyzer <file.wav> [...] [--out report.html] [--bpm 120] [--key Cmaj]\n";
+        std::cerr << "Usage: take_analyzer <file.wav|.mp3|.flac> [...] [--out report.html] [--bpm 120] [--key Cmaj]\n";
         return 1;
     }
     std::vector<std::string> wavPaths;
@@ -1614,7 +1730,22 @@ int main(int argc, char* argv[]) {
     float bpm = 0.f;
     for (int i = 1; i < argc; ++i) {
         std::string arg(argv[i]);
-        if (arg == "--out" && i + 1 < argc)      outPath = argv[++i];
+        if (arg == "--help" || arg == "-h") {
+            std::cout << "TakeAnalyzer — compare pitch accuracy across multiple takes\n\n"
+                << "Usage: take_analyzer <file.wav|.mp3|.flac> [...] [options]\n\n"
+                << "Options:\n"
+                << "  --out <path>    Output HTML report path (default: pitch_report.html)\n"
+                << "  --bpm <value>   Set BPM (auto-detected if omitted)\n"
+                << "  --key <key>     Set key/scale, e.g. Cmaj, Am, F#dor, Bbmix\n"
+                << "  --help, -h      Show this help\n\n"
+                << "Supported formats: WAV (8/16/24/32-bit PCM, 32-bit float, RF64)\n"
+#ifdef HAS_SNDFILE
+                << "                   MP3, FLAC, OGG, AIFF (via libsndfile)\n"
+#endif
+                << "\nSupported scales: maj, min, dor, mix, lyd, phry, loc, pent, mpent, blues\n";
+            return 0;
+        }
+        else if (arg == "--out" && i + 1 < argc)      outPath = argv[++i];
         else if (arg == "--bpm" && i + 1 < argc) bpm = std::stof(argv[++i]);
         else if (arg == "--key" && i + 1 < argc) keyStr = argv[++i];
         else wavPaths.push_back(arg);
@@ -1628,7 +1759,7 @@ int main(int argc, char* argv[]) {
     bool bpmDetected = false;
     for (auto& p : wavPaths) {
         std::cout << "Loading: " << p << " ... ";
-        WavFile wav = loadWav(p);
+        WavFile wav = loadAudio(p);
         if (!wav.valid) { std::cerr << "FAILED (" << wav.error << ")\n"; continue; }
         std::cout << (int)(wav.samples.size() / wav.sampleRate) << "s  "
             << wav.sampleRate << "Hz  " << wav.bitsPerSample << "-bit\n";
