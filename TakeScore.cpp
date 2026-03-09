@@ -955,7 +955,7 @@ void generateReport(const std::vector<TakeAnalysis>& takes,
     W(".ab-wrap{position:relative;display:flex;align-items:stretch}\n");
     W(".ab-btn{background:none;border:none;border-right:1px solid var(--border);color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:10px;padding:0 9px;cursor:pointer;transition:color .1s}\n");
     W(".ab-btn:hover,.ab-btn.on{color:var(--acc)}\n");
-    W(".ab-menu{display:none;position:absolute;top:100%;left:0;background:var(--s1);border:1px solid var(--border2);border-radius:3px;z-index:20;min-width:120px;padding:2px 0}\n");
+    W(".ab-menu{display:none;position:fixed;background:var(--s1);border:1px solid var(--border2);border-radius:3px;z-index:9999;min-width:120px;padding:2px 0}\n");
     W(".ab-menu.show{display:block}\n");
     W(".ab-opt{display:block;width:100%;background:none;border:none;color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:10px;padding:4px 10px;cursor:pointer;text-align:left}\n");
     W(".ab-opt:hover{background:var(--s2);color:var(--text)}\n");
@@ -1179,6 +1179,9 @@ function buildABMenu(){
 abBtn.addEventListener('click',e=>{
   e.stopPropagation();
   buildABMenu();
+  const r=abBtn.getBoundingClientRect();
+  abMenu.style.top=r.bottom+'px';
+  abMenu.style.left=r.left+'px';
   abMenu.classList.toggle('show');
 });
 document.addEventListener('click',()=>abMenu.classList.remove('show'));
