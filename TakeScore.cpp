@@ -831,7 +831,10 @@ void generateReport(const std::vector<TakeAnalysis>& takes,
     // Body
     W(".body{display:flex;flex:1;min-height:0}\n");
     // Left panel
-    W(".lpanel{width:300px;flex-shrink:0;display:flex;flex-direction:column;border-right:1px solid var(--border);overflow:hidden}\n");
+    W(".lpanel{width:300px;flex-shrink:0;display:flex;flex-direction:column;border-right:none;overflow:hidden}\n");
+    // Divider
+    W(".divider{width:5px;flex-shrink:0;cursor:col-resize;background:var(--border);position:relative;transition:background .15s}\n");
+    W(".divider:hover,.divider.active{background:var(--acc)}\n");
     W(".ph{display:flex;align-items:center;justify-content:space-between;padding:7px 10px;border-bottom:1px solid var(--border);flex-shrink:0}\n");
     W(".ph .lbl{font-family:'IBM Plex Mono',monospace;font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--muted)}\n");
     W(".exp-btn{background:var(--s2);border:1px solid var(--border2);color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:9px;padding:3px 8px;border-radius:3px;cursor:pointer;transition:color .15s}\n");
@@ -915,6 +918,9 @@ void generateReport(const std::vector<TakeAnalysis>& takes,
     W("    <th>Acc</th><th>+/-c</th>\n");
     W("    <th>Stab</th><th>Voiced</th>\n");
     W("  </tr></thead>\n<tbody id=\"stbody\"></tbody>\n</table></div>\n</div>\n");
+
+    // Divider
+    W("<div class=\"divider\" id=\"divider\"></div>\n");
 
     // Right panel
     W("<div class=\"rpanel\">\n");
@@ -1524,12 +1530,43 @@ window.addEventListener('keydown',e=>{
   else if(e.key==='r'||e.key==='R'){delete vps[ati];initVP(ati);redraw();}
 });
 
+// -- Divider drag ----------------------------------------------
+{
+  const div=document.getElementById('divider');
+  const lp=document.querySelector('.lpanel');
+  let divDrag=null;
+  div.addEventListener('mousedown',e=>{
+    if(e.button!==0)return;
+    e.preventDefault();
+    divDrag={x:e.clientX,w:lp.offsetWidth};
+    div.classList.add('active');
+    document.body.style.cursor='col-resize';
+    document.body.style.userSelect='none';
+  });
+  window.addEventListener('mousemove',e=>{
+    if(!divDrag)return;
+    const nw=Math.max(140,Math.min(600,divDrag.w+(e.clientX-divDrag.x)));
+    lp.style.width=nw+'px';
+    resizeAll();
+  });
+  window.addEventListener('mouseup',()=>{
+    if(divDrag){
+      divDrag=null;
+      div.classList.remove('active');
+      document.body.style.cursor='';
+      document.body.style.userSelect='';
+    }
+  });
+}
+
 // -- Resize ----------------------------------------------------
 new ResizeObserver(resizeAll).observe(document.querySelector('.app'));
 document.getElementById('tog-btn').addEventListener('click',()=>{
   const lp=document.querySelector('.lpanel');
+  const dv=document.getElementById('divider');
   const shown=lp.style.display!=='none';
   lp.style.display=shown?'none':'';
+  dv.style.display=shown?'none':'';
   document.getElementById('tog-btn').textContent=shown?'scores (hidden)':'scores';
   redraw();
 });
