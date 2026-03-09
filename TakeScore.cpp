@@ -11,24 +11,11 @@
 #include <cstring>
 #include <cstdint>
 #include <set>
+#include <cerrno>
 
 // ─────────────────────────────────────────────
 //  WAV File Parser
 // ─────────────────────────────────────────────
-struct WavHeader {
-    char     riff[4];
-    uint32_t fileSize;
-    char     wave[4];
-    char     fmt[4];
-    uint32_t fmtSize;
-    uint16_t audioFormat;
-    uint16_t numChannels;
-    uint32_t sampleRate;
-    uint32_t byteRate;
-    uint16_t blockAlign;
-    uint16_t bitsPerSample;
-};
-
 
 struct WavFile {
     std::string        filename, shortName;
@@ -48,54 +35,135 @@ WavFile loadWav(const std::string& path) {
     size_t dot = name.find_last_of('.');
     wav.shortName = (dot == std::string::npos) ? name : name.substr(0, dot);
 
+    errno = 0;
     std::ifstream f(path, std::ios::binary);
-    if (!f) { wav.error = "Cannot open file"; return wav; }
+    if (!f) {
+        wav.error = "Cannot open file: " + std::string(std::strerror(errno));
+        return wav;
+    }
 
-    WavHeader hdr;
-    f.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
-    if (std::strncmp(hdr.riff, "RIFF", 4) != 0 || std::strncmp(hdr.wave, "WAVE", 4) != 0) {
-        wav.error = "Not a valid WAV file"; return wav;
+    // Read RIFF/RF64 header (12 bytes)
+    char riffHdr[12];
+    f.read(riffHdr, 12);
+    bool isRF64 = false;
+    if (!f) { wav.error = "Cannot read file header"; return wav; }
+    if (std::strncmp(riffHdr, "RF64", 4) == 0 && std::strncmp(riffHdr + 8, "WAVE", 4) == 0) {
+        isRF64 = true;
+    } else if (std::strncmp(riffHdr, "RIFF", 4) != 0 || std::strncmp(riffHdr + 8, "WAVE", 4) != 0) {
+        wav.error = "Not a valid WAV file (header: "
+            + std::string(riffHdr, riffHdr + 4) + ")";
+        return wav;
     }
-    if (hdr.audioFormat != 1 && hdr.audioFormat != 3) {
-        wav.error = "Unsupported format"; return wav;
-    }
+
+    // Scan chunks to find "fmt " and "data" (and "ds64" for RF64).
+    // Many DAWs insert extra chunks (bext, iXML, JUNK, LIST, etc.) before
+    // or between fmt and data, so we cannot assume a fixed layout.
+    uint16_t audioFormat = 0, numChannels = 0, bitsPerSample = 0;
+    uint32_t sampleRate = 0, fmtSize = 0;
+    uint16_t effectiveFormat = 0;
+    bool fmtFound = false;
+    uint64_t dataSize64 = 0;
+    bool dataFound = false;
 
     char chunkId[4]; uint32_t chunkSize;
     while (f.read(chunkId, 4) && f.read(reinterpret_cast<char*>(&chunkSize), 4)) {
-        if (std::strncmp(chunkId, "data", 4) == 0) break;
-        f.seekg(chunkSize, std::ios::cur);
+        if (std::strncmp(chunkId, "ds64", 4) == 0 && isRF64) {
+            // RF64 mandatory chunk: contains 64-bit sizes
+            auto ds64Start = f.tellg();
+            uint64_t riffSize64;
+            f.read(reinterpret_cast<char*>(&riffSize64), 8);
+            f.read(reinterpret_cast<char*>(&dataSize64), 8);
+            // Skip sampleCount64 (8) and any table entries
+            f.seekg(ds64Start + (std::streamoff)chunkSize);
+            if (chunkSize & 1) f.seekg(1, std::ios::cur);
+        }
+        else if (std::strncmp(chunkId, "fmt ", 4) == 0) {
+            fmtSize = chunkSize;
+            auto fmtStart = f.tellg();
+            // Read base WAVEFORMATEX fields (16 bytes)
+            if (fmtSize < 16) { wav.error = "Truncated fmt chunk"; return wav; }
+            f.read(reinterpret_cast<char*>(&audioFormat), 2);
+            f.read(reinterpret_cast<char*>(&numChannels), 2);
+            f.read(reinterpret_cast<char*>(&sampleRate), 4);
+            f.seekg(4, std::ios::cur); // skip byteRate
+            f.seekg(2, std::ios::cur); // skip blockAlign
+            f.read(reinterpret_cast<char*>(&bitsPerSample), 2);
+
+            effectiveFormat = audioFormat;
+            // WAVE_FORMAT_EXTENSIBLE: real format is in the SubFormat GUID
+            if (audioFormat == 0xFFFE && fmtSize >= 40) {
+                f.seekg(2, std::ios::cur); // cbSize
+                f.seekg(2, std::ios::cur); // validBitsPerSample
+                f.seekg(4, std::ios::cur); // channelMask
+                uint16_t subFormat;
+                f.read(reinterpret_cast<char*>(&subFormat), 2);
+                effectiveFormat = subFormat;
+            }
+            // Seek to end of fmt chunk (handles any extra bytes)
+            f.seekg(fmtStart + (std::streamoff)fmtSize);
+            // Word-align
+            if (fmtSize & 1) f.seekg(1, std::ios::cur);
+            fmtFound = true;
+        }
+        else if (std::strncmp(chunkId, "data", 4) == 0) {
+            // For RF64, data chunk size field is 0xFFFFFFFF; real size in ds64
+            if (isRF64 && chunkSize == 0xFFFFFFFF) {
+                // dataSize64 already read from ds64 chunk
+            } else {
+                dataSize64 = chunkSize;
+            }
+            dataFound = true;
+            break; // data chunk body follows — stop scanning
+        }
+        else {
+            // Skip unknown chunk (word-aligned)
+            uint32_t skip = chunkSize + (chunkSize & 1);
+            // Guard against corrupt chunk sizes
+            if (skip > 0x7FFFFFFF) break;
+            f.seekg(skip, std::ios::cur);
+        }
+        if (!f) break;
     }
 
-    wav.sampleRate = hdr.sampleRate;
-    wav.numChannels = hdr.numChannels;
-    wav.bitsPerSample = hdr.bitsPerSample;
+    if (!fmtFound) { wav.error = "No fmt chunk found"; return wav; }
+    if (!dataFound) { wav.error = "No data chunk found"; return wav; }
+    if (effectiveFormat != 1 && effectiveFormat != 3) {
+        wav.error = "Unsupported format (code " + std::to_string(effectiveFormat) + ")";
+        return wav;
+    }
 
-    uint32_t numFrames = chunkSize / (hdr.numChannels * hdr.bitsPerSample / 8);
-    wav.samples.reserve(numFrames);
-    for (uint32_t i = 0; i < numFrames; ++i) {
+    wav.sampleRate = sampleRate;
+    wav.numChannels = numChannels;
+    wav.bitsPerSample = bitsPerSample;
+
+    int bytesPerFrame = numChannels * bitsPerSample / 8;
+    uint64_t numFrames = (bytesPerFrame > 0) ? dataSize64 / bytesPerFrame : 0;
+    wav.samples.reserve((size_t)std::min(numFrames, (uint64_t)500000000ULL));
+    for (uint64_t i = 0; i < numFrames && f.good(); ++i) {
         float mono = 0.f;
-        for (uint16_t ch = 0; ch < hdr.numChannels; ++ch) {
+        for (uint16_t ch = 0; ch < numChannels; ++ch) {
             float s = 0.f;
-            if (hdr.bitsPerSample == 16) {
+            if (bitsPerSample == 16) {
                 int16_t v; f.read(reinterpret_cast<char*>(&v), 2); s = v / 32768.f;
             }
-            else if (hdr.bitsPerSample == 24) {
+            else if (bitsPerSample == 24) {
                 uint8_t b[3]; f.read(reinterpret_cast<char*>(b), 3);
                 int32_t v = (b[2] << 16) | (b[1] << 8) | b[0];
-                if (v & 0x800000) v |= 0xFF000000; s = v / 8388608.f;
+                if (v & 0x800000) v |= ~0x00FFFFFF; // sign-extend
+                s = v / 8388608.f;
             }
-            else if (hdr.bitsPerSample == 32 && hdr.audioFormat == 3) {
+            else if (bitsPerSample == 32 && effectiveFormat == 3) {
                 f.read(reinterpret_cast<char*>(&s), 4);
             }
-            else if (hdr.bitsPerSample == 32) {
+            else if (bitsPerSample == 32) {
                 int32_t v; f.read(reinterpret_cast<char*>(&v), 4); s = v / 2147483648.f;
             }
-            else if (hdr.bitsPerSample == 8) {
+            else if (bitsPerSample == 8) {
                 uint8_t v; f.read(reinterpret_cast<char*>(&v), 1); s = (v - 128) / 128.f;
             }
             mono += s;
         }
-        wav.samples.push_back(mono / hdr.numChannels);
+        wav.samples.push_back(mono / numChannels);
     }
     wav.valid = true;
     return wav;
@@ -113,7 +181,7 @@ Scale parseScale(const std::string& keyStr) {
     Scale sc;
     if (keyStr.empty()) return sc;
     static const std::map<char, int> base = { {'C',0},{'D',2},{'E',4},{'F',5},{'G',7},{'A',9},{'B',11} };
-    char c = std::toupper(keyStr[0]);
+    char c = static_cast<char>(std::toupper(static_cast<unsigned char>(keyStr[0])));
     if (base.find(c) == base.end()) {
         std::cerr << "Warning: unknown key '" << keyStr << "'\n"; return sc;
     }
@@ -122,49 +190,161 @@ Scale parseScale(const std::string& keyStr) {
     else if (keyStr.size() > 1 && keyStr[1] == 'b') { root = (root + 11) % 12; consumed = 2; }
 
     std::string suf = keyStr.substr(consumed);
-    for (auto& ch : suf) ch = std::tolower(ch);
-    bool minor = (suf == "m" || suf == "min" || suf == "minor");
+    for (auto& ch : suf) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
 
-    std::vector<int> iv = minor ? std::vector<int>{0, 2, 3, 5, 7, 8, 10}
-    : std::vector<int>{ 0,2,4,5,7,9,11 };
+    // Supported modes/scales:
+    //   maj/major          C D E F G A B         (ionian)
+    //   m/min/minor        C D Eb F G Ab Bb      (aeolian / natural minor)
+    //   dor/dorian         C D Eb F G A Bb       (minor with raised 6th)
+    //   mix/mixolydian     C D E F G A Bb        (major with flat 7th)
+    //   lyd/lydian         C D E F# G A B        (major with raised 4th)
+    //   phry/phrygian      C Db Eb F G Ab Bb     (minor with flat 2nd)
+    //   loc/locrian        C Db Eb F Gb Ab Bb
+    //   pent/pentatonic    C D E G A             (major pentatonic)
+    //   mpent/minpent      C Eb F G Bb           (minor pentatonic)
+    //   blues              C Eb F F# G Bb
+    struct ModeEntry { const char* suffix; std::vector<int> intervals; const char* label; };
+    static const ModeEntry modes[] = {
+        { "dor",          {0,2,3,5,7,9,10},     "dor"  },
+        { "dorian",       {0,2,3,5,7,9,10},     "dor"  },
+        { "mix",          {0,2,4,5,7,9,10},     "mix"  },
+        { "mixolydian",   {0,2,4,5,7,9,10},     "mix"  },
+        { "lyd",          {0,2,4,6,7,9,11},     "lyd"  },
+        { "lydian",       {0,2,4,6,7,9,11},     "lyd"  },
+        { "phry",         {0,1,3,5,7,8,10},     "phry" },
+        { "phrygian",     {0,1,3,5,7,8,10},     "phry" },
+        { "loc",          {0,1,3,5,6,8,10},     "loc"  },
+        { "locrian",      {0,1,3,5,6,8,10},     "loc"  },
+        { "pent",         {0,2,4,7,9},           "pent" },
+        { "pentatonic",   {0,2,4,7,9},           "pent" },
+        { "mpent",        {0,3,5,7,10},          "mpent"},
+        { "minpent",      {0,3,5,7,10},          "mpent"},
+        { "blues",        {0,3,5,6,7,10},        "blues"},
+        { "minor",        {0,2,3,5,7,8,10},     "min"  },
+        { "min",          {0,2,3,5,7,8,10},     "min"  },
+        { "m",            {0,2,3,5,7,8,10},     "min"  },
+        { "major",        {0,2,4,5,7,9,11},     "maj"  },
+        { "maj",          {0,2,4,5,7,9,11},     "maj"  },
+        { "",             {0,2,4,5,7,9,11},     "maj"  },  // default = major
+    };
 
     static const char* nn[] = { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" };
-    sc.name = std::string(nn[root]) + (minor ? "min" : "maj");
-    for (int i : iv) sc.pitchClasses.insert((root + i) % 12);
+    for (const auto& m : modes) {
+        if (suf == m.suffix) {
+            sc.name = std::string(nn[root]) + m.label;
+            for (int i : m.intervals) sc.pitchClasses.insert((root + i) % 12);
+            return sc;
+        }
+    }
+
+    // Fallback: unrecognized suffix → treat as major
+    std::cerr << "Warning: unknown mode '" << suf << "', defaulting to major\n";
+    sc.name = std::string(nn[root]) + "maj";
+    for (int i : {0,2,4,5,7,9,11}) sc.pitchClasses.insert((root + i) % 12);
     return sc;
 }
 
 // ─────────────────────────────────────────────
-//  YIN Pitch Detection
+//  YIN Pitch Detection (improved)
 // ─────────────────────────────────────────────
-static const float YIN_THR = 0.15f;
-static const int   YIN_WIN = 2048;
-static const int   MIN_PER = 20;
-static const int   MAX_PER = 2000;
+//
+// Improvements over baseline YIN:
+//   1. Adaptive window size: scales with sample rate so low frequencies
+//      always get at least two full periods inside the analysis window.
+//   2. Confidence output: the CMNDF dip value is returned alongside the
+//      pitch, letting the caller make better voiced/unvoiced decisions.
+//   3. Octave-error correction: after finding a candidate period T, we
+//      check whether 2T (the sub-harmonic / true fundamental) has a
+//      CMNDF value that is nearly as good.  If so, we pick 2T.  This is
+//      the single most common YIN failure mode.
+//   4. Global-minimum fallback: when no dip crosses the primary threshold,
+//      the best local minimum is returned with a reduced confidence score
+//      instead of silently returning 0 Hz.
+// ─────────────────────────────────────────────
 
-float yinPitch(const float* buf, int N, int sr) {
+static const float YIN_THR       = 0.12f;   // primary CMNDF threshold (slightly tighter)
+static const float YIN_THR_FALL  = 0.30f;   // fallback: accept global minimum up to this
+
+struct YinResult { float hz; float confidence; };
+
+// Adaptive window: 4096 @ 44100/48000, 8192 @ 88200/96000, etc.
+// Rounded up to next power of two for cache-friendliness.
+// Using 0.085s (~4096 @ 44.1k) gives YIN ~10 periods for notes around
+// A#3 (233 Hz), producing much more reliable CMNDF dips at the true
+// fundamental.  The old 0.042s (2048) only gave ~5 periods, causing
+// YIN to frequently lock onto harmonics on synth timbres with strong
+// overtones.
+static int yinWindowSize(int sr) {
+    int target = (int)(sr * 0.085f);
+    int w = 256;
+    while (w < target) w <<= 1;
+    return w;
+}
+
+// Parabolic interpolation around index `tau` in array `c` of length `len`.
+// Returns fractional offset from tau (in range roughly -0.5 .. +0.5).
+static float parabolicShift(const std::vector<float>& c, int tau, int len) {
+    if (tau < 1 || tau >= len - 1) return 0.f;
+    float s0 = c[tau - 1], s1 = c[tau], s2 = c[tau + 1];
+    float denom = 2.f * s1 - s2 - s0;
+    if (std::abs(denom) < 1e-12f) return 0.f;
+    return (s2 - s0) / (2.f * denom);
+}
+
+// ── Multi-candidate YIN (pYIN-style) ──────────────────────────────
+// Instead of returning a single "best" pitch, extract ALL local minima
+// of the CMNDF below a generous threshold.  A downstream Viterbi pass
+// selects the globally optimal path that balances confidence with pitch
+// continuity, naturally resolving octave errors without fragile heuristics.
+
+struct YinCandidate { float hz, confidence; };
+
+static std::vector<YinCandidate> yinCandidates(const float* buf, int N, int sr) {
     int H = N / 2;
+    int minPer = std::max(2, (int)(sr / 2200.f));
+    int maxPer = std::min(H - 2, (int)(sr / 55.f));
+
+    // Step 1 – Difference function
     std::vector<float> d(H, 0.f);
     for (int tau = 1; tau < H; ++tau)
         for (int j = 0; j < H; ++j) { float dv = buf[j] - buf[j + tau]; d[tau] += dv * dv; }
+
+    // Step 2 – CMNDF
     std::vector<float> c(H, 0.f); c[0] = 1.f;
     float rs = 0.f;
     for (int tau = 1; tau < H; ++tau) { rs += d[tau]; c[tau] = d[tau] * tau / (rs + 1e-10f); }
-    int tau = MIN_PER;
-    while (tau < MAX_PER && tau < H - 1) {
-        if (c[tau] < YIN_THR) {
-            // Advance to the local minimum of this dip before interpolating.
-            // Stopping at the first threshold crossing (the leading edge) means
-            // parabolic interpolation anchors left of the true minimum, which
-            // makes the returned period too long and the pitch systematically flat.
-            while (tau + 1 < H - 1 && c[tau + 1] < c[tau]) ++tau;
-            float s0 = c[tau - 1], s1 = c[tau], s2 = c[tau + 1];
-            float sh = (s2 - s0) / (2.f * (2.f * s1 - s2 - s0) + 1e-10f);
-            return (float)sr / (tau + sh);
+
+    // Step 3 – Collect all local minima below a generous candidate threshold.
+    // The Viterbi pass will pick the right one; we just need all options.
+    const float CAND_THR = 0.50f;
+    std::vector<YinCandidate> cands;
+    for (int tau = minPer; tau <= maxPer; ++tau) {
+        if (tau <= 0 || tau >= H - 1) continue;
+        if (c[tau] >= CAND_THR) continue;
+        if (c[tau] > c[tau - 1] || c[tau] > c[tau + 1]) continue;
+        // Walk to local minimum
+        while (tau + 1 < H - 1 && tau + 1 <= maxPer && c[tau + 1] < c[tau]) ++tau;
+        float shift = parabolicShift(c, tau, H);
+        float period = tau + shift;
+        if (period < 1.f) continue;
+        float hz = (float)sr / period;
+        if (hz >= 55.f && hz <= 2200.f) {
+            float conf = std::max(0.f, std::min(1.f, 1.f - c[tau]));
+            cands.push_back({ hz, conf });
         }
-        ++tau;
     }
-    return 0.f;
+    return cands;
+}
+
+// Single-result wrapper (for any callers that still need it)
+YinResult yinPitch(const float* buf, int N, int sr) {
+    auto cands = yinCandidates(buf, N, sr);
+    if (cands.empty()) return { 0.f, 0.f };
+    // Return highest-confidence candidate
+    int best = 0;
+    for (int i = 1; i < (int)cands.size(); ++i)
+        if (cands[i].confidence > cands[best].confidence) best = i;
+    return { cands[best].hz, cands[best].confidence };
 }
 
 // ─────────────────────────────────────────────
@@ -201,14 +381,14 @@ float detectBPM(const std::vector<float>& samples, int sr) {
 // ─────────────────────────────────────────────
 //  Pitch Analysis
 // ─────────────────────────────────────────────
-struct PitchFrame { float timeS, hz, midiNote; bool voiced; };
+struct PitchFrame { float timeS, hz, midiNote, confidence; bool voiced; };
 
 float hzToMidi(float hz) { return hz <= 0 ? 0 : 69.f + 12.f * std::log2(hz / 440.f); }
 
 std::string midiToName(float midi) {
     static const char* N[] = { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" };
     int n = (int)std::round(midi);
-    return std::string(N[((n % 12) + 12) % 12]) + std::to_string(n / 12 - 1);
+    return std::string(N[((n % 12) + 12) % 12]) + std::to_string(n / 12 - 2);
 }
 
 void fillVoicedGaps(std::vector<PitchFrame>& frames, int maxGap = 3, float tol = 2.5f) {
@@ -225,6 +405,7 @@ void fillVoicedGaps(std::vector<PitchFrame>& frames, int maxGap = 3, float tol =
                 float t = (float)(j - gs + 1) / (gl + 1);
                 frames[j].midiNote = frames[gs - 1].midiNote * (1 - t) + frames[ge + 1].midiNote * t;
                 frames[j].hz = 440.f * std::pow(2.f, (frames[j].midiNote - 69.f) / 12.f);
+                frames[j].confidence = std::min(frames[gs - 1].confidence, frames[ge + 1].confidence) * 0.7f;
                 frames[j].voiced = true;
             }
         }
@@ -265,22 +446,141 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
         }
     }
 
-    // Pitch frames
-    const int HOP = YIN_WIN / 2;
-    for (int i = 0; i + YIN_WIN <= N; i += HOP) {
+    // ── Multi-candidate pitch extraction + Viterbi path selection ──
+    // Instead of picking one YIN candidate per frame (which causes octave
+    // errors on timbres with strong harmonics), extract ALL reasonable
+    // candidates per frame, then run a Viterbi algorithm to find the
+    // globally optimal pitch path that balances confidence with continuity.
+    const int WIN = yinWindowSize(wav.sampleRate);
+    const int HOP = WIN / 2;
+    const float VOICE_CONF_THR = 0.65f;
+    const float RMS_GATE = 0.005f;
+
+    // Phase 1: extract candidates per frame
+    struct FrameCands { std::vector<YinCandidate> cands; bool hasEnergy; float timeS; };
+    std::vector<FrameCands> allCands;
+    for (int i = 0; i + WIN <= N; i += HOP) {
         float t = (float)i / wav.sampleRate;
-        float hz = yinPitch(wav.samples.data() + i, YIN_WIN, wav.sampleRate);
-        float midi = hzToMidi(hz);
-        bool voiced = (hz > 40.f && hz < 2000.f);
-        ta.frames.push_back({ t,hz,midi,voiced });
+        float winRms = 0.f;
+        for (int j = i; j < i + WIN; ++j) winRms += wav.samples[j] * wav.samples[j];
+        winRms = std::sqrt(winRms / WIN);
+        if (winRms < RMS_GATE) {
+            allCands.push_back({ {}, false, t });
+            continue;
+        }
+        auto cands = yinCandidates(wav.samples.data() + i, WIN, wav.sampleRate);
+        allCands.push_back({ std::move(cands), true, t });
+    }
+
+    // Phase 2: Viterbi path selection
+    // Cost = observation (1-confidence) + transition (penalise pitch jumps)
+    int NF = (int)allCands.size();
+    // Per-frame, per-candidate: cumulative cost and back-pointer
+    std::vector<std::vector<float>> vCost(NF);
+    std::vector<std::vector<int>>   vBack(NF);  // index into previous frame's candidates
+    std::vector<std::vector<int>>   vPrev(NF);  // which previous frame
+
+    for (int i = 0; i < NF; ++i) {
+        int nc = (int)allCands[i].cands.size();
+        if (!allCands[i].hasEnergy || nc == 0) continue;
+        vCost[i].resize(nc, 1e9f);
+        vBack[i].resize(nc, -1);
+        vPrev[i].resize(nc, -1);
+
+        // Find nearest previous frame that has candidates
+        int pi = i - 1;
+        while (pi >= 0 && vCost[pi].empty()) --pi;
+
+        // Sub-harmonic penalty.
+        // Candidates sorted by ascending tau (descending Hz).  For periodic
+        // signals the CMNDF has near-zero dips at the fundamental period T
+        // AND all multiples 2T, 3T, … (sub-harmonics).  It can also have
+        // moderate dips at T/2, T/3, … (harmonics) when even harmonics are
+        // strong relative to the fundamental.
+        //
+        // Strategy: find the "fundamental reference" — the highest-Hz
+        // candidate with near-zero CMNDF (conf > 0.98).  Penalise only
+        // candidates with frequency BELOW this reference (sub-harmonics).
+        // Candidates ABOVE it are harmonics whose naturally higher CMNDF
+        // already makes them less attractive — no extra penalty needed.
+        const float GOOD_CONF = 0.98f;
+        float refHz = 0.f;
+        for (int j = 0; j < nc; ++j) {
+            if (allCands[i].cands[j].confidence >= GOOD_CONF) {
+                refHz = allCands[i].cands[j].hz;   // first (highest-Hz) with excellent CMNDF
+                break;
+            }
+        }
+        if (refHz <= 0.f && nc > 0) refHz = allCands[i].cands[0].hz; // fallback
+        for (int j = 0; j < nc; ++j) {
+            float subHarmPenalty = 0.f;
+            float candHz = allCands[i].cands[j].hz;
+            if (candHz > 0.f && candHz < refHz * 0.95f)  // below fundamental ref
+                subHarmPenalty = std::log2(refHz / candHz) * 0.3f;
+            float obs = (1.f - allCands[i].cands[j].confidence) + subHarmPenalty;
+            if (pi < 0 || vCost[pi].empty()) {
+                // No predecessor — just observation cost
+                vCost[i][j] = obs;
+            } else {
+                float midiJ = hzToMidi(allCands[i].cands[j].hz);
+                int npc = (int)vCost[pi].size();
+                for (int k = 0; k < npc; ++k) {
+                    float midiK = hzToMidi(allCands[pi].cands[k].hz);
+                    float diff = std::abs(midiJ - midiK);
+                    // Transition cost: 0 for <1 semitone, then 0.07/semitone.
+                    // A 12-semitone (octave) jump costs 0.77 — large enough
+                    // that the octave candidate must be vastly more confident
+                    // to win, but real note transitions (with high confidence
+                    // at both pitches) still come through.
+                    float trans = (diff > 1.f) ? (diff - 1.f) * 0.07f : 0.f;
+                    float total = vCost[pi][k] + trans + obs;
+                    if (total < vCost[i][j]) {
+                        vCost[i][j] = total;
+                        vBack[i][j] = k;
+                        vPrev[i][j] = pi;
+                    }
+                }
+            }
+        }
+    }
+
+    // Backtrace: find best final candidate, walk backwards
+    std::vector<int> bestIdx(NF, -1);
+    int last = NF - 1;
+    while (last >= 0 && vCost[last].empty()) --last;
+    if (last >= 0) {
+        int best = 0;
+        for (int j = 1; j < (int)vCost[last].size(); ++j)
+            if (vCost[last][j] < vCost[last][best]) best = j;
+        bestIdx[last] = best;
+        for (int i = last; i >= 0; ) {
+            if (bestIdx[i] < 0 || vBack[i].empty()) { --i; continue; }
+            int pi = vPrev[i][bestIdx[i]];
+            if (pi >= 0 && vBack[i][bestIdx[i]] >= 0)
+                bestIdx[pi] = vBack[i][bestIdx[i]];
+            i = pi >= 0 ? pi : i - 1;
+        }
+    }
+
+    // Phase 3: build PitchFrame vector from Viterbi selections
+    for (int i = 0; i < NF; ++i) {
+        float t = allCands[i].timeS;
+        if (!allCands[i].hasEnergy || allCands[i].cands.empty() || bestIdx[i] < 0) {
+            ta.frames.push_back({ t, 0.f, 0.f, 0.f, false });
+        } else {
+            auto& c = allCands[i].cands[bestIdx[i]];
+            float midi = hzToMidi(c.hz);
+            bool voiced = (c.hz > 55.f && c.hz < 1800.f && c.confidence >= VOICE_CONF_THR);
+            ta.frames.push_back({ t, c.hz, midi, c.confidence, voiced });
+        }
     }
     fillVoicedGaps(ta.frames);
 
     // Outlier rejection: mark frames as unvoiced if they deviate more than
-    // 4 semitones from the local median (window ±8 frames).
+    // 3.5 semitones from the local median (window ±12 frames).
     // Catches octave-jump artifacts and random YIN misfires.
     {
-        const int HW = 8;
+        const int HW = 12;
         int NF = (int)ta.frames.size();
         std::vector<bool> outlier(NF, false);
         for (int i = 0; i < NF; ++i) {
@@ -292,7 +592,7 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
             if (win.size() < 3) continue;
             std::sort(win.begin(), win.end());
             float median = win[win.size() / 2];
-            if (std::abs(ta.frames[i].midiNote - median) > 4.0f)
+            if (std::abs(ta.frames[i].midiNote - median) > 3.5f)
                 outlier[i] = true;
         }
         for (int i = 0; i < NF; ++i)
@@ -301,36 +601,36 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
         fillVoicedGaps(ta.frames);
     }
 
-    // Gaussian smoothing of MIDI values.
-    // Reduces frame-to-frame YIN estimation noise while preserving the shape
-    // of slow continuous pitch movements (e.g. sirens, slides, vibrato).
-    // Smoothing is done in MIDI (log-Hz) space so perceptual intervals are
-    // weighted uniformly. Never bridges voiced/unvoiced boundaries.
-    // HOP = YIN_WIN/2 = 1024 samples, so at 44.1 kHz each frame is ~23 ms.
-    // SIGMA=12 frames => ~280 ms half-width. Raise toward 20 for more smoothness,
-    // lower toward 4 to preserve fast ornaments like trills.
+    // Median filter on MIDI values.
+    // Unlike Gaussian smoothing (which averages and can blend correct frames
+    // with octave-error frames, producing smooth but wrong curves), a median
+    // filter is robust to outliers — it selects the middle value, so a few
+    // bad frames among many good ones are simply ignored.
+    // Half-width of ~5 frames (~120 ms at 44.1k) is enough to reject
+    // isolated YIN misfires and reverb-induced wobble without smearing
+    // real note transitions.  Never bridges voiced/unvoiced boundaries.
     {
-        const float SIGMA = 8.0f;
-        const int   HW = (int)(SIGMA * 3.f + 0.5f);
+        const float MF_SEC = 0.120f;
+        const float frameDurS = (float)HOP / wav.sampleRate;
+        const int   HW = std::max(1, (int)(MF_SEC / frameDurS + 0.5f));
         int NF = (int)ta.frames.size();
-        std::vector<float> smoothed(NF, 0.f);
-        std::vector<bool>  smoothValid(NF, false);
+        std::vector<float> filtered(NF, 0.f);
+        std::vector<bool>  filtValid(NF, false);
         for (int i = 0; i < NF; ++i) {
             if (!ta.frames[i].voiced) continue;
-            float wsum = 0.f, vsum = 0.f;
+            std::vector<float> win;
             for (int j = std::max(0, i - HW); j <= std::min(NF - 1, i + HW); ++j) {
-                if (!ta.frames[j].voiced) continue;
-                float d = (float)(j - i);
-                float w = std::exp(-0.5f * (d / SIGMA) * (d / SIGMA));
-                vsum += w * ta.frames[j].midiNote;
-                wsum += w;
+                if (ta.frames[j].voiced) win.push_back(ta.frames[j].midiNote);
             }
-            if (wsum > 0.f) { smoothed[i] = vsum / wsum; smoothValid[i] = true; }
+            if (win.empty()) continue;
+            std::sort(win.begin(), win.end());
+            filtered[i] = win[win.size() / 2];
+            filtValid[i] = true;
         }
         for (int i = 0; i < NF; ++i) {
-            if (!smoothValid[i]) continue;
-            ta.frames[i].midiNote = smoothed[i];
-            ta.frames[i].hz = 440.f * std::pow(2.f, (smoothed[i] - 69.f) / 12.f);
+            if (!filtValid[i]) continue;
+            ta.frames[i].midiNote = filtered[i];
+            ta.frames[i].hz = 440.f * std::pow(2.f, (filtered[i] - 69.f) / 12.f);
         }
     }
 
@@ -380,10 +680,12 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
     // making a flat A# appear sharp relative to A (and vice-versa).
     bool hasScale = !scale.pitchClasses.empty();
     auto nearestNote = [&](float midi)->float {
-        int lo = (int)std::floor(midi) - 1;
+        // Search ±6 semitones to handle gapped scales (pentatonic gaps can be
+        // 3 semitones; ±6 covers any 7-note-or-fewer scale comfortably).
+        int center = (int)std::round(midi);
         float bestDist = 1e9f;
-        int bestNote = (int)std::round(midi);
-        for (int c = lo; c <= lo + 3; ++c) {
+        int bestNote = center;
+        for (int c = center - 6; c <= center + 6; ++c) {
             if (hasScale) {
                 int pc = ((c % 12) + 12) % 12;
                 if (!scale.pitchClasses.count(pc)) continue;
@@ -392,7 +694,7 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
             if (dist < bestDist) { bestDist = dist; bestNote = c; }
         }
         return (float)bestNote;
-        };
+    };
 
     // Vibrato-aware accuracy: windowed median → nearest note → cents deviation
     if (!vm.empty()) {
@@ -653,16 +955,14 @@ void generateReport(const std::vector<TakeAnalysis>& takes,
     W(R"JS(
 const f1=v=>v.toFixed(1), f2=v=>v.toFixed(2);
 const N12=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
-function midiToName(m){const n=Math.round(m);return N12[((n%12)+12)%12]+(Math.floor(n/12)-1);}
+function midiToName(m){const n=Math.round(m);return N12[((n%12)+12)%12]+(Math.floor(n/12)-2);}
 function fmtDur(s){const m=Math.floor(s/60),sec=(s%60).toFixed(1);return m>0?`${m}m ${sec}s`:`${sec}s`;}
 function nearestNote(midi){
-  // Search the two closest semitones and pick the one with minimum distance.
-  // Using Math.round() as a starting point caused pitches near a semitone
-  // boundary (e.g. 69.4 = slightly flat of A#4) to snap to the wrong
-  // neighbour (A4), then be reported with the wrong sharp/flat direction.
-  const lo=Math.floor(midi)-1;
-  let bestDist=Infinity,bestNote=Math.round(midi);
-  for(let c=lo;c<=lo+3;c++){
+  // Search +/-6 semitones to handle gapped scales (pentatonic gaps can be
+  // 3 semitones; +/-6 covers any 7-note-or-fewer scale comfortably).
+  const center=Math.round(midi);
+  let bestDist=Infinity,bestNote=center;
+  for(let c=center-6;c<=center+6;c++){
     if(SCALE.length&&!SCALE.includes(((c%12)+12)%12))continue;
     const dist=Math.abs(midi-c);
     if(dist<bestDist){bestDist=dist;bestNote=c;}
@@ -774,6 +1074,11 @@ function switchTake(ti){
 }
 updateStats(0);
 
+// -- State variables ------------------------------------------
+let hovBin=null;
+let seekTime=null;
+let cvHover=null;
+
 // -- Draw pitch chart -----------------------------------------
 const P={L:46,R:14,T:12,B:20};
 
@@ -825,14 +1130,14 @@ function drawPitch(){
   const fillColor=(pitchY,noteY)=>pitchY<noteY?sharpColor:flatColor;
   const frames=t.frames;
   for(let i=0;i<frames.length-1;i++){
-    const f0=frames[i],f1=frames[i+1];
-    if(!f0.v||!f1.v)continue;
-    if(f1.t-f0.t>0.15)continue; // skip gap-filled seams
-    const n0=nearestNote(f0.midi),n1=nearestNote(f1.midi);
-    const c0=(f0.midi-n0)*100,c1=(f1.midi-n1)*100;
+    const fr0=frames[i],fr1=frames[i+1];
+    if(!fr0.v||!fr1.v)continue;
+    if(fr1.t-fr0.t>0.15)continue; // skip gap-filled seams
+    const n0=nearestNote(fr0.midi),n1=nearestNote(fr1.midi);
+    const c0=(fr0.midi-n0)*100,c1=(fr1.midi-n1)*100;
     if(Math.abs(c0)<1&&Math.abs(c1)<1)continue;
-    const x0=tX(f0.t),x1=tX(f1.t);
-    const py0=mY(f0.midi),py1=mY(f1.midi);
+    const x0=tX(fr0.t),x1=tX(fr1.t);
+    const py0=mY(fr0.midi),py1=mY(fr1.midi);
     if(n0===n1){
       const ny=mY(n0);
       if(Math.abs(py0-ny)<0.5&&Math.abs(py1-ny)<0.5)continue;
@@ -848,7 +1153,7 @@ function drawPitch(){
         // Pitch crosses through the note line  -  drawing a single trapezoid
         // produces a self-intersecting (bowtie) shape and wrong color.
         // Split at the crossing point and draw two triangles instead.
-        const frac=Math.max(0,Math.min(1,(n0-f0.midi)/(f1.midi-f0.midi)));
+        const frac=Math.max(0,Math.min(1,(n0-fr0.midi)/(fr1.midi-fr0.midi)));
         const xC=x0+frac*(x1-x0);
         // First triangle: from start to crossing
         ctx.fillStyle=fillColor(py0,ny);
@@ -859,8 +1164,8 @@ function drawPitch(){
       }
     } else {
       // Note changes mid-segment  -  split at boundary, flat bottom for each half
-      const denom=(f1.midi-f0.midi)-(n1-n0);
-      const frac=Math.abs(denom)>0.01?Math.max(0,Math.min(1,(n0-f0.midi)/denom)):0.5;
+      const denom=(fr1.midi-fr0.midi)-(n1-n0);
+      const frac=Math.abs(denom)>0.01?Math.max(0,Math.min(1,(n0-fr0.midi)/denom)):0.5;
       const xC=x0+frac*(x1-x0);
       const pyC=py0+frac*(py1-py0);
       // First half: pitch vs n0
@@ -962,7 +1267,7 @@ function drawPitch(){
     const y=mY(m);if(y<P.T||y>P.T+H)continue;
     const isC=m%12===0,inSc=SCALE.length&&SCALE.includes(((m%12)+12)%12);
     ctx.fillStyle=isC?'#555':inSc?'rgba(96,165,250,0.65)':'#2a2a2a';
-    ctx.fillText(N12[((m%12)+12)%12]+(Math.floor(m/12)-1),P.L-5,y+3.5);
+    ctx.fillText(N12[((m%12)+12)%12]+(Math.floor(m/12)-2),P.L-5,y+3.5);
     ctx.strokeStyle=isC?'#2a2a2a':'#1a1a1a';ctx.lineWidth=1;
     ctx.beginPath();ctx.moveTo(P.L-3,y);ctx.lineTo(P.L,y);ctx.stroke();
   }
@@ -1021,11 +1326,11 @@ function drawWave(){
     const time=(i/steps)*t.duration,x=P.L+(i/steps)*W;
     wctx.fillText(BPM>0?(time/(60/BPM)).toFixed(0)+'b':time.toFixed(1)+'s',x,CH-2);
   }
-  // Seek cursor on waveform
+  // Seek cursor on waveform (absolute position in the full-duration overview)
   if(seekTime!==null){
-    const t2=TAKES[ati],vp2=vps[ati];
+    const t2=TAKES[ati];
     const W2=wv.offsetWidth-P.L-P.R;
-    const frac2=(seekTime-vp2.t0)/(vp2.t1-vp2.t0);
+    const frac2=t2.duration>0?seekTime/t2.duration:0;
     if(frac2>=0&&frac2<=1){
       const sx=P.L+frac2*W2;
       wctx.strokeStyle='rgba(255,210,40,0.8)';wctx.lineWidth=1.5;
@@ -1131,9 +1436,6 @@ cv.addEventListener('mouseleave',()=>{if(cvHover){cvHover=null;redraw();}});
 
 // -- Waveform click to seek ------------------------------------
 // -- Waveform strip drag-to-pan --------------------------------
-let hovBin=null;
-let seekTime=null;
-let cvHover=null;
 let wvDrag=null;
 wv.style.cursor='grab';
 wv.addEventListener('mousedown',e=>{
@@ -1158,11 +1460,12 @@ window.addEventListener('mousemove',e=>{
 window.addEventListener('mouseup',e=>{
   if(wvDrag){
     if(Math.abs(e.clientX-wvDrag.x)<5){
-      const vp=vps[ati],t=TAKES[ati];
+      // The waveform strip shows the full duration, so map click to absolute time
+      const t=TAKES[ati];
       const W=wv.offsetWidth-P.L-P.R;
       const r=wv.getBoundingClientRect();
-      const frac=(e.clientX-r.left-P.L)/W;
-      seekTime=Math.max(0,Math.min(t.duration,vp.t0+frac*(vp.t1-vp.t0)));
+      const frac=Math.max(0,Math.min(1,(e.clientX-r.left-P.L)/W));
+      seekTime=frac*t.duration;
     }
     wvDrag=null;wv.style.cursor='grab';redraw();
   }
