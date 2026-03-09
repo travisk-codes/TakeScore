@@ -909,6 +909,8 @@ void generateReport(const std::vector<TakeAnalysis>& takes,
     W("tbody tr{cursor:pointer;transition:background .1s}\n");
     W("tbody tr:hover td{background:var(--s1)}\n");
     W("tbody tr.arow td{background:var(--s2)}\n");
+    W("tbody tr.brow td{background:rgba(168,85,247,.10)}\n");
+    W("tbody tr.brow td .rnk{outline:1.5px solid rgba(168,85,247,.6);outline-offset:1px}\n");
     W("tbody tr.winner td.nc{color:var(--win)}\n");
     W(".rnk{display:inline-flex;align-items:center;justify-content:center;width:17px;height:17px;border-radius:3px;background:var(--s2);font-size:9px;font-weight:600}\n");
     W(".rnk.r1{background:var(--win);color:#0c0c0c}\n");
@@ -924,6 +926,7 @@ void generateReport(const std::vector<TakeAnalysis>& takes,
     W(".tab{background:none;border:none;border-right:1px solid var(--border);border-bottom:2px solid transparent;color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:10px;padding:0 11px;cursor:pointer;white-space:nowrap;transition:color .1s}\n");
     W(".tab:hover{color:var(--text)}\n");
     W(".tab.active{color:var(--text);border-bottom-color:var(--text)}\n");
+    W(".tab.btab{color:rgba(168,85,247,.85);border-bottom:2px solid rgba(168,85,247,.7)}\n");
     W(".tab.wt.active{color:var(--win);border-bottom-color:var(--win)}\n");
     W(".sbar{display:flex;align-items:center;gap:0;flex:1;overflow:hidden;font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted)}\n");
     W(".si{white-space:nowrap;padding:0 8px;border-right:1px solid var(--border);height:100%;display:flex;align-items:center;gap:4px}\n");
@@ -1152,6 +1155,7 @@ function switchTake(ti){
   if(bti===ti){bti=-1;document.getElementById('ab-btn').classList.remove('on');document.getElementById('leg-overlay').style.display='none';}
   document.querySelectorAll('.tab').forEach((b,i)=>b.classList.toggle('active',i===ti));
   updateStats(ti);
+  updateBIndicators();
   redraw();
 }
 updateStats(0);
@@ -1165,14 +1169,14 @@ function buildABMenu(){
   const off=document.createElement('button');
   off.className='ab-opt'+(bti<0?' sel':'');
   off.textContent='Off';
-  off.addEventListener('click',()=>{bti=-1;abBtn.classList.remove('on');abMenu.classList.remove('show');document.getElementById('leg-overlay').style.display='none';redraw();});
+  off.addEventListener('click',()=>{bti=-1;abBtn.classList.remove('on');abMenu.classList.remove('show');document.getElementById('leg-overlay').style.display='none';updateBIndicators();redraw();});
   abMenu.appendChild(off);
   TAKES.forEach((t,i)=>{
     if(i===ati)return;
     const opt=document.createElement('button');
     opt.className='ab-opt'+(i===bti?' sel':'');
     opt.textContent=t.name;
-    opt.addEventListener('click',()=>{bti=i;abBtn.classList.add('on');abMenu.classList.remove('show');document.getElementById('leg-overlay').style.display='';redraw();});
+    opt.addEventListener('click',()=>{bti=i;abBtn.classList.add('on');abMenu.classList.remove('show');document.getElementById('leg-overlay').style.display='';updateBIndicators();redraw();});
     abMenu.appendChild(opt);
   });
 }
@@ -1185,6 +1189,13 @@ abBtn.addEventListener('click',e=>{
   abMenu.classList.toggle('show');
 });
 document.addEventListener('click',()=>abMenu.classList.remove('show'));
+
+function updateBIndicators(){
+  document.querySelectorAll('#stbody tr').forEach((tr,i)=>{
+    tr.classList.toggle('brow',bti>=0&&TAKES.indexOf(sorted[i])===bti);
+  });
+  document.querySelectorAll('.tab').forEach((b,i)=>b.classList.toggle('btab',i===bti));
+}
 
 // -- State variables ------------------------------------------
 let hovBin=null;
