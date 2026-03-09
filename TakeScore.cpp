@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cstdint>
 #include <set>
+#include <cerrno>
 
 // ─────────────────────────────────────────────
 //  WAV File Parser
@@ -34,29 +35,49 @@ WavFile loadWav(const std::string& path) {
     size_t dot = name.find_last_of('.');
     wav.shortName = (dot == std::string::npos) ? name : name.substr(0, dot);
 
+    errno = 0;
     std::ifstream f(path, std::ios::binary);
-    if (!f) { wav.error = "Cannot open file"; return wav; }
-
-    // Read RIFF header (12 bytes)
-    char riffHdr[12];
-    f.read(riffHdr, 12);
-    if (!f || std::strncmp(riffHdr, "RIFF", 4) != 0 || std::strncmp(riffHdr + 8, "WAVE", 4) != 0) {
-        wav.error = "Not a valid WAV file"; return wav;
+    if (!f) {
+        wav.error = "Cannot open file: " + std::string(std::strerror(errno));
+        return wav;
     }
 
-    // Scan chunks to find "fmt " and "data".
+    // Read RIFF/RF64 header (12 bytes)
+    char riffHdr[12];
+    f.read(riffHdr, 12);
+    bool isRF64 = false;
+    if (!f) { wav.error = "Cannot read file header"; return wav; }
+    if (std::strncmp(riffHdr, "RF64", 4) == 0 && std::strncmp(riffHdr + 8, "WAVE", 4) == 0) {
+        isRF64 = true;
+    } else if (std::strncmp(riffHdr, "RIFF", 4) != 0 || std::strncmp(riffHdr + 8, "WAVE", 4) != 0) {
+        wav.error = "Not a valid WAV file (header: "
+            + std::string(riffHdr, riffHdr + 4) + ")";
+        return wav;
+    }
+
+    // Scan chunks to find "fmt " and "data" (and "ds64" for RF64).
     // Many DAWs insert extra chunks (bext, iXML, JUNK, LIST, etc.) before
     // or between fmt and data, so we cannot assume a fixed layout.
     uint16_t audioFormat = 0, numChannels = 0, bitsPerSample = 0;
     uint32_t sampleRate = 0, fmtSize = 0;
     uint16_t effectiveFormat = 0;
     bool fmtFound = false;
-    uint32_t dataSize = 0;
+    uint64_t dataSize64 = 0;
     bool dataFound = false;
 
     char chunkId[4]; uint32_t chunkSize;
     while (f.read(chunkId, 4) && f.read(reinterpret_cast<char*>(&chunkSize), 4)) {
-        if (std::strncmp(chunkId, "fmt ", 4) == 0) {
+        if (std::strncmp(chunkId, "ds64", 4) == 0 && isRF64) {
+            // RF64 mandatory chunk: contains 64-bit sizes
+            auto ds64Start = f.tellg();
+            uint64_t riffSize64;
+            f.read(reinterpret_cast<char*>(&riffSize64), 8);
+            f.read(reinterpret_cast<char*>(&dataSize64), 8);
+            // Skip sampleCount64 (8) and any table entries
+            f.seekg(ds64Start + (std::streamoff)chunkSize);
+            if (chunkSize & 1) f.seekg(1, std::ios::cur);
+        }
+        else if (std::strncmp(chunkId, "fmt ", 4) == 0) {
             fmtSize = chunkSize;
             auto fmtStart = f.tellg();
             // Read base WAVEFORMATEX fields (16 bytes)
@@ -85,13 +106,21 @@ WavFile loadWav(const std::string& path) {
             fmtFound = true;
         }
         else if (std::strncmp(chunkId, "data", 4) == 0) {
-            dataSize = chunkSize;
+            // For RF64, data chunk size field is 0xFFFFFFFF; real size in ds64
+            if (isRF64 && chunkSize == 0xFFFFFFFF) {
+                // dataSize64 already read from ds64 chunk
+            } else {
+                dataSize64 = chunkSize;
+            }
             dataFound = true;
             break; // data chunk body follows — stop scanning
         }
         else {
             // Skip unknown chunk (word-aligned)
-            f.seekg(chunkSize + (chunkSize & 1), std::ios::cur);
+            uint32_t skip = chunkSize + (chunkSize & 1);
+            // Guard against corrupt chunk sizes
+            if (skip > 0x7FFFFFFF) break;
+            f.seekg(skip, std::ios::cur);
         }
         if (!f) break;
     }
@@ -107,9 +136,10 @@ WavFile loadWav(const std::string& path) {
     wav.numChannels = numChannels;
     wav.bitsPerSample = bitsPerSample;
 
-    uint32_t numFrames = dataSize / (numChannels * bitsPerSample / 8);
-    wav.samples.reserve(numFrames);
-    for (uint32_t i = 0; i < numFrames && f.good(); ++i) {
+    int bytesPerFrame = numChannels * bitsPerSample / 8;
+    uint64_t numFrames = (bytesPerFrame > 0) ? dataSize64 / bytesPerFrame : 0;
+    wav.samples.reserve((size_t)std::min(numFrames, (uint64_t)500000000ULL));
+    for (uint64_t i = 0; i < numFrames && f.good(); ++i) {
         float mono = 0.f;
         for (uint16_t ch = 0; ch < numChannels; ++ch) {
             float s = 0.f;
