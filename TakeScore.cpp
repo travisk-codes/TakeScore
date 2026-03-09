@@ -358,7 +358,7 @@ float hzToMidi(float hz) { return hz <= 0 ? 0 : 69.f + 12.f * std::log2(hz / 440
 std::string midiToName(float midi) {
     static const char* N[] = { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" };
     int n = (int)std::round(midi);
-    return std::string(N[((n % 12) + 12) % 12]) + std::to_string(n / 12 - 1);
+    return std::string(N[((n % 12) + 12) % 12]) + std::to_string(n / 12 - 2);
 }
 
 void fillVoicedGaps(std::vector<PitchFrame>& frames, int maxGap = 3, float tol = 2.5f) {
@@ -913,7 +913,7 @@ void generateReport(const std::vector<TakeAnalysis>& takes,
     W(R"JS(
 const f1=v=>v.toFixed(1), f2=v=>v.toFixed(2);
 const N12=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
-function midiToName(m){const n=Math.round(m);return N12[((n%12)+12)%12]+(Math.floor(n/12)-1);}
+function midiToName(m){const n=Math.round(m);return N12[((n%12)+12)%12]+(Math.floor(n/12)-2);}
 function fmtDur(s){const m=Math.floor(s/60),sec=(s%60).toFixed(1);return m>0?`${m}m ${sec}s`:`${sec}s`;}
 function nearestNote(midi){
   // Search +/-6 semitones to handle gapped scales (pentatonic gaps can be
@@ -1225,7 +1225,7 @@ function drawPitch(){
     const y=mY(m);if(y<P.T||y>P.T+H)continue;
     const isC=m%12===0,inSc=SCALE.length&&SCALE.includes(((m%12)+12)%12);
     ctx.fillStyle=isC?'#555':inSc?'rgba(96,165,250,0.65)':'#2a2a2a';
-    ctx.fillText(N12[((m%12)+12)%12]+(Math.floor(m/12)-1),P.L-5,y+3.5);
+    ctx.fillText(N12[((m%12)+12)%12]+(Math.floor(m/12)-2),P.L-5,y+3.5);
     ctx.strokeStyle=isC?'#2a2a2a':'#1a1a1a';ctx.lineWidth=1;
     ctx.beginPath();ctx.moveTo(P.L-3,y);ctx.lineTo(P.L,y);ctx.stroke();
   }
