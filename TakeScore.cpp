@@ -497,12 +497,12 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
                 for (int k = 0; k < npc; ++k) {
                     float midiK = hzToMidi(allCands[pi].cands[k].hz);
                     float diff = std::abs(midiJ - midiK);
-                    // Transition cost: 0 for <1 semitone, then 0.05/semitone.
-                    // A 12-semitone (octave) jump costs 0.55 — large enough
+                    // Transition cost: 0 for <1 semitone, then 0.07/semitone.
+                    // A 12-semitone (octave) jump costs 0.77 — large enough
                     // that the octave candidate must be vastly more confident
                     // to win, but real note transitions (with high confidence
                     // at both pitches) still come through.
-                    float trans = (diff > 1.f) ? (diff - 1.f) * 0.05f : 0.f;
+                    float trans = (diff > 1.f) ? (diff - 1.f) * 0.07f : 0.f;
                     float total = vCost[pi][k] + trans + obs;
                     if (total < vCost[i][j]) {
                         vCost[i][j] = total;
@@ -547,10 +547,10 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
     fillVoicedGaps(ta.frames);
 
     // Outlier rejection: mark frames as unvoiced if they deviate more than
-    // 4 semitones from the local median (window ±8 frames).
+    // 3.5 semitones from the local median (window ±12 frames).
     // Catches octave-jump artifacts and random YIN misfires.
     {
-        const int HW = 8;
+        const int HW = 12;
         int NF = (int)ta.frames.size();
         std::vector<bool> outlier(NF, false);
         for (int i = 0; i < NF; ++i) {
@@ -562,7 +562,7 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
             if (win.size() < 3) continue;
             std::sort(win.begin(), win.end());
             float median = win[win.size() / 2];
-            if (std::abs(ta.frames[i].midiNote - median) > 4.0f)
+            if (std::abs(ta.frames[i].midiNote - median) > 3.5f)
                 outlier[i] = true;
         }
         for (int i = 0; i < NF; ++i)
@@ -576,11 +576,11 @@ TakeAnalysis analyzeTake(const WavFile& wav, const Scale& scale) {
     // with octave-error frames, producing smooth but wrong curves), a median
     // filter is robust to outliers — it selects the middle value, so a few
     // bad frames among many good ones are simply ignored.
-    // Half-width of ~3 frames (~70 ms at 44.1k) is enough to reject
-    // isolated YIN misfires without smearing real note transitions.
-    // Never bridges voiced/unvoiced boundaries.
+    // Half-width of ~5 frames (~120 ms at 44.1k) is enough to reject
+    // isolated YIN misfires and reverb-induced wobble without smearing
+    // real note transitions.  Never bridges voiced/unvoiced boundaries.
     {
-        const float MF_SEC = 0.070f;
+        const float MF_SEC = 0.120f;
         const float frameDurS = (float)HOP / wav.sampleRate;
         const int   HW = std::max(1, (int)(MF_SEC / frameDurS + 0.5f));
         int NF = (int)ta.frames.size();
